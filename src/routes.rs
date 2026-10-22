@@ -47,7 +47,7 @@ pub struct UserConfigs {
     subscriptions: Vec<CreateUserSubscription>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SetUserConfig {
     pub npub: PublicKey,
     pub amount_sats: u64,
@@ -57,6 +57,21 @@ pub struct SetUserConfig {
     pub auth_id: Option<PublicKey>,
     pub emoji: Option<String>,
     pub donations: Option<Vec<DonationConfig>>,
+}
+
+/// Manual `Debug` so an NWC connection string (wallet spend authority) can never
+/// reach a log line through `{:?}`.
+impl std::fmt::Debug for SetUserConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetUserConfig")
+            .field("npub", &self.npub)
+            .field("amount_sats", &self.amount_sats)
+            .field("nwc", &self.nwc.as_ref().map(|_| "<redacted>"))
+            .field("auth_id", &self.auth_id)
+            .field("emoji", &self.emoji)
+            .field("donations", &self.donations)
+            .finish()
+    }
 }
 
 impl SetUserConfig {
@@ -108,7 +123,7 @@ impl DonationConfig {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CreateUserSubscription {
     pub npub: PublicKey,
     pub to_npub: PublicKey,
@@ -118,6 +133,20 @@ pub struct CreateUserSubscription {
     pub nwc: Option<NostrWalletConnectURI>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_id: Option<PublicKey>,
+}
+
+/// Manual `Debug`: see `SetUserConfig`.
+impl std::fmt::Debug for CreateUserSubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateUserSubscription")
+            .field("npub", &self.npub)
+            .field("to_npub", &self.to_npub)
+            .field("amount_sats", &self.amount_sats)
+            .field("time_period", &self.time_period)
+            .field("nwc", &self.nwc.as_ref().map(|_| "<redacted>"))
+            .field("auth_id", &self.auth_id)
+            .finish()
+    }
 }
 
 impl CreateUserSubscription {
@@ -904,6 +933,41 @@ mod test {
             server_keys,
             xpriv,
         }
+    }
+
+    #[test]
+    fn debug_output_never_contains_nwc_secret() {
+        let nwc = NostrWalletConnectURI::from_str(NWC).unwrap();
+        let secret_hex = nwc.secret.display_secret().to_string();
+
+        let zap = SetUserConfig {
+            npub: PublicKey::from_str(
+                "e1ff3bfdd4e40315959b08b4fcc8245eaa514637e1d4ec2ae166b743341be1af",
+            )
+            .unwrap(),
+            amount_sats: 21,
+            nwc: Some(nwc.clone()),
+            auth_id: None,
+            emoji: None,
+            donations: None,
+        };
+        let out = format!("{zap:?}");
+        assert!(out.contains("<redacted>"), "{out}");
+        assert!(!out.contains(&secret_hex), "{out}");
+        assert!(!out.contains("secret="), "{out}");
+
+        let sub = CreateUserSubscription {
+            npub: zap.npub,
+            to_npub: zap.npub,
+            amount_sats: 21,
+            time_period: SubscriptionPeriod::Day,
+            nwc: Some(nwc),
+            auth_id: None,
+        };
+        let out = format!("{sub:?}");
+        assert!(out.contains("<redacted>"), "{out}");
+        assert!(!out.contains(&secret_hex), "{out}");
+        assert!(!out.contains("secret="), "{out}");
     }
 
     fn clear_database(state: &State) {
