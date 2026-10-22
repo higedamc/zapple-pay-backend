@@ -94,8 +94,8 @@ pub fn upsert_user(conn: &mut PgConnection, config: SetUserConfig) -> anyhow::Re
             (None, None) => {
                 error!("zap_config.nwc and zap_config.auth_index are both None, this should never happen");
             },
-            (Some(nwc), Some(auth_index)) => {
-                error!("zap_config.nwc {nwc} and zap_config.auth_index {auth_index} are both Some, this should never happen");
+            (Some(_nwc), Some(auth_index)) => {
+                error!("zap_config.nwc and zap_config.auth_index ({auth_index}) are both Some, this should never happen");
             },
             _ => {} // expected
         }
@@ -173,8 +173,8 @@ pub fn upsert_subscription(
             (None, None) => {
                 error!("sub_config.nwc and sub_config.auth_index are both None, this should never happen");
             },
-            (Some(nwc), Some(auth_index)) => {
-                error!("sub_config.nwc {nwc} and sub_config.auth_index {auth_index} are both Some, this should never happen");
+            (Some(_nwc), Some(auth_index)) => {
+                error!("sub_config.nwc and sub_config.auth_index ({auth_index}) are both Some, this should never happen");
             },
             _ => {} // expected
         }
