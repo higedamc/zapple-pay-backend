@@ -7,6 +7,13 @@ use std::str::FromStr;
 
 use super::schema::wallet_auth;
 
+/// Upper bound on the number of not-yet-linked NWA keys the listener watches
+/// at once. Every pending key becomes an identifier in the relay filter, so
+/// an unbounded list lets one client grow the subscription until the relay
+/// rejects the whole REQ, zap filters included. 250 is the per-filter chunk
+/// size used for the other filters, so the pending set is always one filter.
+pub const MAX_PENDING_WALLET_AUTHS: usize = 250;
+
 #[derive(
     Queryable,
     Insertable,
@@ -154,10 +161,16 @@ impl WalletAuth {
                 wallet_auth::created_at
                     .lt(chrono::Utc::now().naive_utc() - chrono::Duration::days(1)),
             )
+            .order(wallet_auth::created_at.desc())
+            .limit(MAX_PENDING_WALLET_AUTHS as i64)
             .load::<String>(conn)?;
 
+        // Newest N selected above; hand them back oldest-first so the list
+        // has the same shape `push_pending_auth` maintains at runtime
+        // (push at the tail, evict from the head).
         let unlinked = unlinked
             .into_iter()
+            .rev()
             .filter_map(|s| PublicKey::from_str(&s).ok())
             .collect();
 
@@ -221,6 +234,50 @@ mod test {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// The startup seed for the listener's pending-auth list is bounded to
+    /// the newest `MAX_PENDING_WALLET_AUTHS` qualifying rows and returned
+    /// oldest-first, matching the runtime list shape.
+    #[tokio::test]
+    async fn test_get_unlinked_is_bounded_and_oldest_first() {
+        use crate::models::schema::wallet_auth;
+        use crate::models::wallet_auth::MAX_PENDING_WALLET_AUTHS;
+        use diesel::{ExpressionMethods, QueryDsl};
+
+        let db_pool = init_db();
+        let conn = &mut db_pool.get().unwrap();
+        let xpriv = ExtendedPrivKey::new_master(bitcoin::Network::Testnet, &[]).unwrap();
+
+        // Only rows older than a day qualify, so fresh rows left behind by
+        // other tests are invisible here; remove any old ones from a prior run.
+        let cutoff = chrono::Utc::now().naive_utc() - chrono::Duration::days(1);
+        diesel::delete(wallet_auth::table.filter(wallet_auth::created_at.lt(cutoff)))
+            .execute(conn)
+            .unwrap();
+        assert!(WalletAuth::get_unlinked(conn).unwrap().is_empty());
+
+        // MAX + 2 unlinked rows, created one second apart, all older than a day.
+        let extra = 2;
+        let base = chrono::Utc::now().naive_utc() - chrono::Duration::days(3);
+        let mut created: Vec<PublicKey> = Vec::new();
+        for i in 0..(MAX_PENDING_WALLET_AUTHS + extra) {
+            let auth = WalletAuth::create(conn, xpriv).unwrap();
+            diesel::update(wallet_auth::table.filter(wallet_auth::index.eq(auth.index)))
+                .set(wallet_auth::created_at.eq(base + chrono::Duration::seconds(i as i64)))
+                .execute(conn)
+                .unwrap();
+            created.push(auth.pubkey());
+        }
+
+        let unlinked = WalletAuth::get_unlinked(conn).unwrap();
+        assert_eq!(unlinked.len(), MAX_PENDING_WALLET_AUTHS);
+        // The two oldest fell outside the window; the rest come back oldest-first.
+        assert_eq!(unlinked.as_slice(), &created[extra..]);
+
+        diesel::delete(wallet_auth::table.filter(wallet_auth::created_at.lt(cutoff)))
+            .execute(conn)
+            .unwrap();
     }
 
     #[tokio::test]

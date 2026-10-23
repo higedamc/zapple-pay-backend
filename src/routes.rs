@@ -1,12 +1,13 @@
 use crate::auth::{require_owner, AuthedPubkey};
 use crate::models::subscription_config::SubscriptionConfig;
 use crate::models::user::User;
-use crate::models::wallet_auth::WalletAuth;
+use crate::models::wallet_auth::{WalletAuth, MAX_PENDING_WALLET_AUTHS};
 use crate::models::zap_config::ZapConfig;
 use crate::models::zap_event::ZapEvent;
 use crate::nip49::{NIP49Budget, SubscriptionPeriod, NIP49URI};
 use crate::utils::map_emoji;
 use crate::{utils, State, DEFAULT_AUTH_RELAY};
+use axum::body::Bytes;
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -783,20 +784,60 @@ pub async fn wallet_auth_impl(
 
     // notify new auth key
     let auths = state.auth_channel.lock().await;
-    auths.send_if_modified(|current| {
-        // public_key should be unique, don't need to check for duplicates
-        current.push(public_key);
-        true
-    });
+    auths.send_if_modified(|current| push_pending_auth(current, public_key));
 
     Ok(uri)
 }
 
+/// Add `key` to the list of pending NWA keys the listener subscribes to.
+/// Duplicates are ignored and the list never exceeds
+/// [`MAX_PENDING_WALLET_AUTHS`]; when full, the oldest pending key is dropped
+/// from the watch list. Its DB row stays unlinked, and a wallet response for
+/// it is simply never delivered by the relay (the identifier is no longer in
+/// the filter), so the user has to start that connection again. Returns
+/// whether the list changed, which is what `watch::Sender::send_if_modified`
+/// wants.
+pub(crate) fn push_pending_auth(current: &mut Vec<PublicKey>, key: PublicKey) -> bool {
+    if current.contains(&key) {
+        return false;
+    }
+    if current.len() >= MAX_PENDING_WALLET_AUTHS {
+        let excess = current.len() + 1 - MAX_PENDING_WALLET_AUTHS;
+        current.drain(..excess);
+    }
+    current.push(key);
+    true
+}
+
+/// NWA bootstrap. POST-only and behind the NIP-98 + allowlist layer: each call
+/// inserts a `wallet_auth` row, derives a key from the server xpriv and grows
+/// the relay subscription, so it must never be reachable anonymously. The
+/// optional JSON body carries the budget and the autozap target `identity`;
+/// an empty body means "no budget". A body that is present but not valid
+/// `WalletAuthParams` is a 400 rather than silently becoming "no budget".
+///
+/// The `AuthedPubkey` extension is a trip-wire, not the gate: the gate is the
+/// `route_layer` in `build_router`. If this handler were ever registered
+/// outside that layer the extractor fails with a 500 instead of running.
 pub async fn wallet_auth(
     Extension(state): Extension<State>,
-    payload: Option<Query<WalletAuthParams>>,
+    Extension(_auth): Extension<AuthedPubkey>,
+    body: Bytes,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let params = payload.map(|p| p.0);
+    let params = if body.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_slice::<WalletAuthParams>(&body).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    String::from(
+                        "{\"status\":\"ERROR\",\"reason\":\"Invalid wallet auth params\"}",
+                    ),
+                )
+            })?,
+        )
+    };
     match wallet_auth_impl(&state, params).await {
         Ok(uri) => Ok(Json(json!({"id": uri.public_key.to_string(), "uri": uri}))),
         Err(e) => Err(handle_anyhow_error(e)),
@@ -1019,6 +1060,7 @@ mod test {
             format!("/delete-user/{PUBKEY}/{}", urlencoding::encode("⚡")),
             format!("/delete-subscription/{PUBKEY}/{PUBKEY2}"),
             "/migrate-emojis".to_string(),
+            "/wallet-auth".to_string(),
         ] {
             // The auth layer sits in front of method routing, so an
             // unauthenticated GET is refused there; an authenticated GET is
@@ -1209,6 +1251,203 @@ mod test {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Every handler behind the auth layer that addresses a resource by npub
+    /// must refuse an allowlisted key that is not that npub. One assertion
+    /// per handler so removing any single `require_owner` call goes red.
+    #[tokio::test]
+    async fn router_every_owner_guard_is_enforced() {
+        let owner = Keys::generate();
+        let state = init_state_allowing(&[owner.public_key()]);
+        clear_database(&state);
+        let app = crate::build_router(state);
+        let emoji = urlencoding::encode("⚡");
+
+        // Body-less handlers: the victim npub is in the path.
+        for path in [
+            format!("/delete-user/{PUBKEY2}/{emoji}"),
+            format!("/delete-subscription/{PUBKEY2}/{PUBKEY}"),
+            format!("/delete-user/{PUBKEY2}"),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(request(
+                    "POST",
+                    &path,
+                    Some(signed(&owner, HttpMethod::POST, &path, None)),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "POST {path}");
+        }
+
+        // Body handlers: the victim npub is in the JSON.
+        let bodies = [
+            (
+                "/set-user",
+                format!(r#"{{"npub":"{PUBKEY2}","amount_sats":21,"nwc":"{NWC}","emoji":"⚡"}}"#),
+            ),
+            (
+                "/create-subscription",
+                format!(
+                    r#"{{"npub":"{PUBKEY2}","to_npub":"{PUBKEY}","amount_sats":21,"time_period":"day","nwc":"{NWC}"}}"#
+                ),
+            ),
+        ];
+        for (path, body) in bodies {
+            let res = app
+                .clone()
+                .oneshot(request(
+                    "POST",
+                    path,
+                    Some(signed(&owner, HttpMethod::POST, path, Some(&body))),
+                    Some(body.clone()),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "POST {path} {body}");
+        }
+
+        // Nothing above may have written anything.
+        let res = app
+            .oneshot(request("GET", &format!("/get-user/{PUBKEY2}"), None, None))
+            .await
+            .unwrap();
+        let text = body_string(res).await;
+        assert!(text.contains(r#""zaps":[]"#), "{text}");
+        assert!(text.contains(r#""subscriptions":[]"#), "{text}");
+    }
+
+    /// `/wallet-auth` creates state (DB row, derived key, relay filter) and is
+    /// therefore POST-only behind the auth layer. Through the real router: no
+    /// header -> 401, bad JSON -> 400 with no row written, valid -> 200 with
+    /// the new key both in the response and on the listener channel.
+    #[tokio::test]
+    async fn router_wallet_auth_is_authenticated_and_bounded() {
+        let owner = Keys::generate();
+        let state = init_state_allowing(&[owner.public_key()]);
+        clear_database(&state);
+        let mut rx = state.auth_channel.lock().await.subscribe();
+        let app = crate::build_router(state.clone());
+        let rows = || -> i64 {
+            use diesel::QueryDsl;
+            crate::models::schema::wallet_auth::table
+                .count()
+                .get_result(&mut state.db_pool.get().unwrap())
+                .unwrap()
+        };
+        let rows_before = rows();
+
+        let res = app
+            .clone()
+            .oneshot(request("POST", "/wallet-auth", None, None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        let bad = r#"{"amount":"not a number"}"#.to_string();
+        let res = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/wallet-auth",
+                Some(signed(&owner, HttpMethod::POST, "/wallet-auth", Some(&bad))),
+                Some(bad),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !rx.has_changed().unwrap(),
+            "bad params must not create a key"
+        );
+        assert_eq!(rows(), rows_before, "bad params must not insert a row");
+
+        // No body: no budget.
+        let res = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/wallet-auth",
+                Some(signed(&owner, HttpMethod::POST, "/wallet-auth", None)),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let text = body_string(res).await;
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let id1 = PublicKey::from_str(v["id"].as_str().unwrap()).unwrap();
+        assert!(v["uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("nostr+walletauth://"));
+        assert!(!v["uri"].as_str().unwrap().contains("budget"), "{text}");
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().as_slice(), &[id1]);
+
+        // Budget + identity in the body.
+        let body = format!(r#"{{"time_period":"day","amount":1000,"identity":"{PUBKEY2}"}}"#);
+        let res = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/wallet-auth",
+                Some(signed(
+                    &owner,
+                    HttpMethod::POST,
+                    "/wallet-auth",
+                    Some(&body),
+                )),
+                Some(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v: Value = serde_json::from_str(&body_string(res).await).unwrap();
+        let id2 = PublicKey::from_str(v["id"].as_str().unwrap()).unwrap();
+        assert_ne!(id1, id2);
+        assert!(v["uri"].as_str().unwrap().contains("budget=1000%2Fday"));
+        assert!(v["uri"].as_str().unwrap().contains(PUBKEY2));
+        assert_eq!(rx.borrow_and_update().as_slice(), &[id1, id2]);
+        assert_eq!(rows(), rows_before + 2);
+
+        // The pending key is checkable by anyone but not yet linked.
+        let res = app
+            .oneshot(request(
+                "GET",
+                &format!("/check-wallet-auth?id={id2}"),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        clear_database(&state);
+    }
+
+    #[test]
+    fn pending_auth_list_dedupes_and_caps() {
+        let mut list: Vec<PublicKey> = Vec::new();
+        let first = Keys::generate().public_key();
+        assert!(push_pending_auth(&mut list, first));
+        assert!(!push_pending_auth(&mut list, first), "duplicate is a no-op");
+        assert_eq!(list.len(), 1);
+
+        while list.len() < MAX_PENDING_WALLET_AUTHS {
+            assert!(push_pending_auth(&mut list, Keys::generate().public_key()));
+        }
+        assert_eq!(list[0], first);
+
+        // One over the cap evicts the oldest, never grows past the cap.
+        let newest = Keys::generate().public_key();
+        assert!(push_pending_auth(&mut list, newest));
+        assert_eq!(list.len(), MAX_PENDING_WALLET_AUTHS);
+        assert!(!list.contains(&first));
+        assert_eq!(*list.last().unwrap(), newest);
     }
 
     #[test]

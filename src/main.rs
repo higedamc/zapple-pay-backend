@@ -45,8 +45,10 @@ mod utils;
 const DEFAULT_AUTH_RELAY: &str = "wss://relay.damus.io";
 
 /// Public (unauthenticated, read-only) routes plus the mutation routes behind
-/// the NIP-98 + allowlist layer. Every route that writes state lives in the
-/// protected sub-router and is POST-only; nothing mutates on GET.
+/// the NIP-98 + allowlist layer. Every route that writes state, including the
+/// NWA bootstrap `/wallet-auth` (which inserts a row and grows the relay
+/// subscription), lives in the protected sub-router and is POST-only; nothing
+/// mutates on GET.
 pub fn build_router(state: State) -> Router {
     let protected = Router::new()
         .route("/set-user", post(set_user_config))
@@ -58,11 +60,11 @@ pub fn build_router(state: State) -> Router {
         .route("/delete-user/:npub/:emoji", post(delete_user_config))
         .route("/delete-user/:npub", post(delete_user_configs))
         .route("/migrate-emojis", post(migrate_emojis))
+        .route("/wallet-auth", post(wallet_auth))
         .route_layer(middleware::from_fn(auth::nip98_auth));
 
     Router::new()
         .route("/.well-known/nostr.json", get(nip05))
-        .route("/wallet-auth", get(wallet_auth))
         .route("/check-wallet-auth", get(check_wallet_auth))
         .route("/count", get(count))
         .route("/relays", get(relays))
