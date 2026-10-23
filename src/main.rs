@@ -9,7 +9,7 @@ use crate::models::MIGRATIONS;
 use crate::routes::*;
 use axum::http::{Method, StatusCode, Uri};
 use axum::routing::{get, post};
-use axum::{http, Extension, Router};
+use axum::{http, middleware, Extension, Router};
 use bitcoin::bip32::ExtendedPrivKey;
 use bitcoin::Network;
 use clap::Parser;
@@ -32,6 +32,7 @@ use tokio::sync::watch::Sender;
 use tokio::sync::{oneshot, watch, Mutex};
 use tower_http::cors::{Any, CorsLayer};
 
+mod auth;
 mod config;
 mod listener;
 mod models;
@@ -43,6 +44,49 @@ mod utils;
 
 const DEFAULT_AUTH_RELAY: &str = "wss://relay.damus.io";
 
+/// Public (unauthenticated, read-only) routes plus the mutation routes behind
+/// the NIP-98 + allowlist layer. Every route that writes state lives in the
+/// protected sub-router and is POST-only; nothing mutates on GET.
+pub fn build_router(state: State) -> Router {
+    let protected = Router::new()
+        .route("/set-user", post(set_user_config))
+        .route("/create-subscription", post(create_user_subscription))
+        .route(
+            "/delete-subscription/:npub/:to_npub",
+            post(delete_user_subscription),
+        )
+        .route("/delete-user/:npub/:emoji", post(delete_user_config))
+        .route("/delete-user/:npub", post(delete_user_configs))
+        .route("/migrate-emojis", post(migrate_emojis))
+        .route_layer(middleware::from_fn(auth::nip98_auth));
+
+    Router::new()
+        .route("/.well-known/nostr.json", get(nip05))
+        .route("/wallet-auth", get(wallet_auth))
+        .route("/check-wallet-auth", get(check_wallet_auth))
+        .route("/count", get(count))
+        .route("/relays", get(relays))
+        .route("/get-user/:npub/:emoji", get(get_user_config))
+        .route("/get-user/:npub", get(get_user_configs))
+        .route("/get-subscriptions/:npub", get(get_user_subscriptions))
+        .route(
+            "/get-subscriptions/:npub/:to_npub",
+            get(get_user_subscription),
+        )
+        .merge(protected)
+        .fallback(fallback)
+        .layer(Extension(state))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_headers(vec![
+                    http::header::CONTENT_TYPE,
+                    http::header::AUTHORIZATION,
+                ])
+                .allow_methods([Method::GET, Method::POST]),
+        )
+}
+
 #[derive(Clone)]
 pub struct State {
     db_pool: Pool<ConnectionManager<PgConnection>>,
@@ -51,6 +95,7 @@ pub struct State {
     auth_channel: Arc<Mutex<Sender<Vec<PublicKey>>>>,
     pub server_keys: Keys,
     pub xpriv: ExtendedPrivKey,
+    pub auth: Arc<auth::Nip98Config>,
 }
 
 #[tokio::main]
@@ -121,6 +166,10 @@ async fn main() -> anyhow::Result<()> {
         auth_channel,
         server_keys: keys.server_keys(),
         xpriv: keys.xprivkey(),
+        auth: Arc::new(auth::Nip98Config::new(
+            &config.public_url,
+            &config.allowed_npub,
+        )?),
     };
 
     let addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
@@ -129,36 +178,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Webserver running on http://{addr}");
 
-    let server_router = Router::new()
-        .route("/.well-known/nostr.json", get(nip05))
-        .route("/wallet-auth", get(wallet_auth))
-        .route("/check-wallet-auth", get(check_wallet_auth))
-        .route("/set-user", post(set_user_config))
-        .route("/create-subscription", post(create_user_subscription))
-        .route(
-            "/delete-subscription/:npub/:to_npub",
-            get(delete_user_subscription),
-        )
-        .route("/delete-user/:npub/:emoji", get(delete_user_config))
-        .route("/delete-user/:npub", get(delete_user_configs))
-        .route("/count", get(count))
-        .route("/relays", get(relays))
-        .route("/migrate-emojis", get(migrate_emojis))
-        .route("/get-user/:npub/:emoji", get(get_user_config))
-        .route("/get-user/:npub", get(get_user_configs))
-        .route("/get-subscriptions/:npub", get(get_user_subscriptions))
-        .route(
-            "/get-subscriptions/:npub/:to_npub",
-            get(get_user_subscription),
-        )
-        .fallback(fallback)
-        .layer(Extension(state.clone()))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_headers(vec![http::header::CONTENT_TYPE])
-                .allow_methods([Method::GET, Method::POST]),
-        );
+    let server_router = build_router(state.clone());
 
     // Set up a oneshot channel to handle shutdown signal
     let (tx, rx) = oneshot::channel();

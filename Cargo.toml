@@ -34,3 +34,5 @@ lazy_static = "1.4"
 
 [dev-dependencies]
 dotenv = "0.15.0"
+tower = "0.4"
+hyper = "0.14"

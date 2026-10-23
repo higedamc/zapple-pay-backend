@@ -32,6 +32,7 @@ pub struct ZapConfig {
     pub user_id: i32,
     pub emoji: String,
     pub amount: i32,
+    #[serde(skip_serializing)]
     nwc: Option<String>,
     created_at: chrono::NaiveDateTime,
     pub auth_index: Option<i32>,
@@ -227,5 +228,25 @@ mod test {
         assert!(out.contains("<redacted>"), "{out}");
         assert!(!out.contains("secret="), "{out}");
         assert!(!out.contains("nostr+walletconnect"), "{out}");
+    }
+
+    /// Wire-side twin of the Debug test: the raw NWC string must never be
+    /// serialized, even if a handler one day returns the model directly.
+    #[test]
+    fn serialized_json_never_contains_nwc() {
+        let config = ZapConfig {
+            id: 1,
+            user_id: 1,
+            emoji: "⚡".to_string(),
+            amount: 21,
+            nwc: Some(NWC.to_string()),
+            created_at: chrono::NaiveDateTime::default(),
+            auth_index: None,
+        };
+        let out = serde_json::to_string(&config).unwrap();
+        assert!(!out.contains("nwc"), "{out}");
+        assert!(!out.contains("secret="), "{out}");
+        assert!(!out.contains("nostr+walletconnect"), "{out}");
+        assert!(out.contains("\"amount\":21"), "{out}");
     }
 }

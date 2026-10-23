@@ -1,3 +1,4 @@
+use crate::auth::{require_owner, AuthedPubkey};
 use crate::models::subscription_config::SubscriptionConfig;
 use crate::models::user::User;
 use crate::models::wallet_auth::WalletAuth;
@@ -328,8 +329,10 @@ pub(crate) async fn set_user_config_impl(
 
 pub async fn set_user_config(
     Extension(state): Extension<State>,
+    Extension(auth): Extension<AuthedPubkey>,
     Json(payload): Json<SetUserConfig>,
 ) -> Result<Json<UserConfigs>, (StatusCode, String)> {
+    require_owner(&auth, &payload.npub)?;
     match set_user_config_impl(payload, &state).await {
         Ok(res) => Ok(Json(res)),
         Err(e) => Err(handle_anyhow_error(e)),
@@ -378,8 +381,10 @@ pub(crate) async fn create_user_subscription_impl(
 
 pub async fn create_user_subscription(
     Extension(state): Extension<State>,
+    Extension(auth): Extension<AuthedPubkey>,
     Json(payload): Json<CreateUserSubscription>,
 ) -> Result<Json<UserConfigs>, (StatusCode, String)> {
+    require_owner(&auth, &payload.npub)?;
     match create_user_subscription_impl(payload, &state).await {
         Ok(res) => Ok(Json(res)),
         Err(e) => Err(handle_anyhow_error(e)),
@@ -602,6 +607,7 @@ pub async fn get_user_subscription(
 pub async fn delete_user_config(
     Path((npub, emoji)): Path<(String, String)>,
     Extension(state): Extension<State>,
+    Extension(auth): Extension<AuthedPubkey>,
 ) -> Result<Json<UserConfigs>, (StatusCode, String)> {
     let npub = PublicKey::from_str(&npub).map_err(|_| {
         (
@@ -609,6 +615,7 @@ pub async fn delete_user_config(
             String::from("{\"status\":\"ERROR\",\"reason\":\"Invalid npub\"}"),
         )
     })?;
+    require_owner(&auth, &npub)?;
 
     let mut conn = state.db_pool.get().map_err(|_| {
         (
@@ -636,6 +643,7 @@ pub async fn delete_user_config(
 pub async fn delete_user_configs(
     Path(npub): Path<String>,
     Extension(state): Extension<State>,
+    Extension(auth): Extension<AuthedPubkey>,
 ) -> Result<Json<UserConfigs>, (StatusCode, String)> {
     let npub = PublicKey::from_str(&npub).map_err(|_| {
         (
@@ -643,6 +651,7 @@ pub async fn delete_user_configs(
             String::from("{\"status\":\"ERROR\",\"reason\":\"Invalid npub\"}"),
         )
     })?;
+    require_owner(&auth, &npub)?;
 
     let mut conn = state.db_pool.get().map_err(|_| {
         (
@@ -670,6 +679,7 @@ pub async fn delete_user_configs(
 pub async fn delete_user_subscription(
     Path((npub, to_npub)): Path<(String, String)>,
     Extension(state): Extension<State>,
+    Extension(auth): Extension<AuthedPubkey>,
 ) -> Result<Json<UserConfigs>, (StatusCode, String)> {
     let npub = PublicKey::from_str(&npub).map_err(|_| {
         (
@@ -677,6 +687,7 @@ pub async fn delete_user_subscription(
             String::from("{\"status\":\"ERROR\",\"reason\":\"Invalid npub\"}"),
         )
     })?;
+    require_owner(&auth, &npub)?;
     let to_npub = PublicKey::from_str(&to_npub).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
@@ -878,7 +889,11 @@ pub async fn relays(
 
 pub async fn migrate_emojis(
     Extension(state): Extension<State>,
+    Extension(auth): Extension<AuthedPubkey>,
 ) -> Result<Json<usize>, (StatusCode, String)> {
+    // Instance-wide maintenance: any allowlisted key may run it. The auth
+    // layer already rejected everyone else.
+    info!("migrate_emojis requested by {}", auth.0);
     let mut conn = state.db_pool.get().map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -895,18 +910,27 @@ pub async fn migrate_emojis(
 mod test {
     use crate::models::MIGRATIONS;
     use crate::routes::*;
+    use axum::body::Body;
+    use axum::http::{header, Request};
+    use axum::response::Response;
     use bitcoin::bip32::ExtendedPrivKey;
     use diesel::r2d2::{ConnectionManager, Pool};
     use diesel::RunQueryDsl;
     use diesel_migrations::MigrationHarness;
+    use nostr::{HttpMethod, Timestamp};
     use std::sync::Arc;
     use tokio::sync::{watch, Mutex};
+    use tower::ServiceExt;
 
     const PUBKEY: &str = "e1ff3bfdd4e40315959b08b4fcc8245eaa514637e1d4ec2ae166b743341be1af";
     const PUBKEY2: &str = "82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2";
     const NWC: &str = "nostr+walletconnect://246be70a7e4966f138e9e48401f33c32a1c428bbfb7aab42e3946beb8bc15e7c?relay=wss%3A%2F%2Frelay.damus.io%2F&secret=23ea701003500d852ba2756460099217f839e1fbc9665e493b56bd2d5912e31b";
 
     fn init_state() -> State {
+        init_state_allowing(&[])
+    }
+
+    fn init_state_allowing(allowed: &[PublicKey]) -> State {
         dotenv::dotenv().ok();
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
         let manager = ConnectionManager::<PgConnection>::new(url);
@@ -938,7 +962,253 @@ mod test {
             auth_channel,
             server_keys,
             xpriv,
+            auth: Arc::new(
+                crate::auth::Nip98Config::new(
+                    TEST_PUBLIC_URL,
+                    &allowed.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            ),
         }
+    }
+
+    const TEST_PUBLIC_URL: &str = "http://localhost:3000";
+
+    fn request(
+        method: &str,
+        path: &str,
+        auth: Option<String>,
+        body: Option<String>,
+    ) -> Request<Body> {
+        let mut b = Request::builder().method(method).uri(path);
+        if let Some(a) = auth {
+            b = b.header(header::AUTHORIZATION, a);
+        }
+        if body.is_some() {
+            b = b.header(header::CONTENT_TYPE, "application/json");
+        }
+        b.body(body.map(Body::from).unwrap_or_else(Body::empty))
+            .unwrap()
+    }
+
+    fn signed(keys: &Keys, method: HttpMethod, path: &str, body: Option<&str>) -> String {
+        crate::auth::test_support::header(
+            keys,
+            method,
+            &format!("{TEST_PUBLIC_URL}{path}"),
+            body.map(str::as_bytes),
+            Timestamp::now(),
+        )
+    }
+
+    async fn body_string(res: Response) -> String {
+        let bytes = hyper::body::to_bytes(res.into_body()).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Mutation paths are POST-only and refuse anything without a valid
+    /// NIP-98 header, before any handler or DB code runs.
+    #[tokio::test]
+    async fn router_rejects_get_and_unauthenticated_mutations() {
+        let app = crate::build_router(init_state());
+
+        let signer = Keys::generate();
+        let app_allowing = crate::build_router(init_state_allowing(&[signer.public_key()]));
+        for path in [
+            format!("/delete-user/{PUBKEY}"),
+            format!("/delete-user/{PUBKEY}/{}", urlencoding::encode("⚡")),
+            format!("/delete-subscription/{PUBKEY}/{PUBKEY2}"),
+            "/migrate-emojis".to_string(),
+        ] {
+            // The auth layer sits in front of method routing, so an
+            // unauthenticated GET is refused there; an authenticated GET is
+            // then refused by the router. Either way nothing runs.
+            let res = app
+                .clone()
+                .oneshot(request("GET", &path, None, None))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "GET {path}");
+
+            let res = app_allowing
+                .clone()
+                .oneshot(request(
+                    "GET",
+                    &path,
+                    Some(signed(&signer, HttpMethod::GET, &path, None)),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "authenticated GET {path}"
+            );
+
+            let res = app
+                .clone()
+                .oneshot(request("POST", &path, None, None))
+                .await
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::UNAUTHORIZED,
+                "POST {path} without header"
+            );
+        }
+
+        let body = format!(r#"{{"npub":"{PUBKEY}","amount_sats":21,"nwc":"{NWC}"}}"#);
+        let res = app
+            .clone()
+            .oneshot(request("POST", "/set-user", None, Some(body.clone())))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        let res = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/set-user",
+                Some("Bearer nope".into()),
+                Some(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // Reads stay open.
+        let res = app
+            .oneshot(request("GET", &format!("/get-user/{PUBKEY}"), None, None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// A correctly signed, allowlisted request may only touch the signer's
+    /// own config; the same request aimed at another npub is forbidden.
+    #[tokio::test]
+    async fn router_enforces_ownership_and_allowlist() {
+        let owner = Keys::generate();
+        let stranger = Keys::generate();
+        let state = init_state_allowing(&[owner.public_key()]);
+        clear_database(&state);
+        let app = crate::build_router(state);
+        let me = owner.public_key();
+
+        // Allowlisted key, resource belongs to someone else -> 403.
+        let path = format!("/delete-user/{PUBKEY2}");
+        let res = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &path,
+                Some(signed(&owner, HttpMethod::POST, &path, None)),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Valid signature but key not on the allowlist -> 403 before ownership.
+        let path = format!("/delete-user/{}", stranger.public_key());
+        let res = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &path,
+                Some(signed(&stranger, HttpMethod::POST, &path, None)),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Owner creates their config end to end through the router.
+        let body = format!(r#"{{"npub":"{me}","amount_sats":21,"nwc":"{NWC}","emoji":"⚡"}}"#);
+        let res = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/set-user",
+                Some(signed(&owner, HttpMethod::POST, "/set-user", Some(&body))),
+                Some(body.clone()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{}", body_string(res).await);
+
+        // Same body, header signed for a body of a different amount -> 401.
+        let other =
+            format!(r#"{{"npub":"{me}","amount_sats":1000000,"nwc":"{NWC}","emoji":"⚡"}}"#);
+        let res = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/set-user",
+                Some(signed(&owner, HttpMethod::POST, "/set-user", Some(&other))),
+                Some(body.clone()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // Owner signs for their own npub but the JSON claims another npub -> 403.
+        let spoof =
+            format!(r#"{{"npub":"{PUBKEY2}","amount_sats":21,"nwc":"{NWC}","emoji":"⚡"}}"#);
+        let res = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/set-user",
+                Some(signed(&owner, HttpMethod::POST, "/set-user", Some(&spoof))),
+                Some(spoof),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // The stored config is readable and never echoes the NWC.
+        let emoji = urlencoding::encode("⚡");
+        let res = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("/get-user/{me}/{emoji}"),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let text = body_string(res).await;
+        assert!(text.contains("\"amount_sats\":21"), "{text}");
+        assert!(!text.contains("secret="), "{text}");
+
+        // Owner deletes their own config -> 200 and the config is gone.
+        let path = format!("/delete-user/{me}/{emoji}");
+        let res = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &path,
+                Some(signed(&owner, HttpMethod::POST, &path, None)),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = app
+            .oneshot(request(
+                "GET",
+                &format!("/get-user/{me}/{emoji}"),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
