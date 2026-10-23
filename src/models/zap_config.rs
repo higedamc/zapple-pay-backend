@@ -21,7 +21,6 @@ use super::schema::zap_configs;
     AsChangeset,
     Serialize,
     Deserialize,
-    Debug,
     Clone,
     PartialEq,
 )]
@@ -36,6 +35,24 @@ pub struct ZapConfig {
     nwc: Option<String>,
     created_at: chrono::NaiveDateTime,
     pub auth_index: Option<i32>,
+}
+
+/// Manual `Debug` with the NWC field redacted. `nwc` here is the raw
+/// connection string (wallet spend authority) as a plain `String`, so a derived
+/// `Debug` would print the secret verbatim. Nothing formats this struct with
+/// `{:?}` today; the impl exists so that can never become a leak.
+impl std::fmt::Debug for ZapConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZapConfig")
+            .field("id", &self.id)
+            .field("user_id", &self.user_id)
+            .field("emoji", &self.emoji)
+            .field("amount", &self.amount)
+            .field("nwc", &self.nwc.as_ref().map(|_| "<redacted>"))
+            .field("created_at", &self.created_at)
+            .field("auth_index", &self.auth_index)
+            .finish()
+    }
 }
 
 #[derive(Insertable, AsChangeset)]
@@ -186,5 +203,29 @@ impl ZapConfig {
 
             Ok(count)
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    const NWC: &str = "nostr+walletconnect://246be70a7e4966f138e9e48401f33c32a1c428bbfb7aab42e3946beb8bc15e7c?relay=wss%3A%2F%2Frelay.damus.io%2F&secret=23ea701003500d852ba2756460099217f839e1fbc9665e493b56bd2d5912e31b";
+
+    #[test]
+    fn debug_output_never_contains_nwc() {
+        let config = ZapConfig {
+            id: 1,
+            user_id: 1,
+            emoji: "⚡".to_string(),
+            amount: 21,
+            nwc: Some(NWC.to_string()),
+            created_at: chrono::NaiveDateTime::default(),
+            auth_index: None,
+        };
+        let out = format!("{config:?}");
+        assert!(out.contains("<redacted>"), "{out}");
+        assert!(!out.contains("secret="), "{out}");
+        assert!(!out.contains("nostr+walletconnect"), "{out}");
     }
 }

@@ -20,7 +20,6 @@ use super::schema::users;
     AsChangeset,
     Serialize,
     Deserialize,
-    Debug,
     Clone,
     PartialEq,
 )]
@@ -37,6 +36,26 @@ pub struct SubscriptionConfig {
     created_at: chrono::NaiveDateTime,
     pub last_paid: Option<chrono::NaiveDateTime>,
     pub auth_index: Option<i32>,
+}
+
+/// Manual `Debug` with the NWC field redacted. `nwc` here is the raw
+/// connection string (wallet spend authority) as a plain `String`, so a derived
+/// `Debug` would print the secret verbatim. Nothing formats this struct with
+/// `{:?}` today; the impl exists so that can never become a leak.
+impl std::fmt::Debug for SubscriptionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubscriptionConfig")
+            .field("id", &self.id)
+            .field("user_id", &self.user_id)
+            .field("to_npub", &self.to_npub)
+            .field("amount", &self.amount)
+            .field("time_period", &self.time_period)
+            .field("nwc", &self.nwc.as_ref().map(|_| "<redacted>"))
+            .field("created_at", &self.created_at)
+            .field("last_paid", &self.last_paid)
+            .field("auth_index", &self.auth_index)
+            .finish()
+    }
 }
 
 #[derive(Insertable, AsChangeset)]
@@ -262,5 +281,31 @@ impl SubscriptionConfig {
             )
             .execute(conn)?)
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    const NWC: &str = "nostr+walletconnect://246be70a7e4966f138e9e48401f33c32a1c428bbfb7aab42e3946beb8bc15e7c?relay=wss%3A%2F%2Frelay.damus.io%2F&secret=23ea701003500d852ba2756460099217f839e1fbc9665e493b56bd2d5912e31b";
+
+    #[test]
+    fn debug_output_never_contains_nwc() {
+        let config = SubscriptionConfig {
+            id: 1,
+            user_id: 1,
+            to_npub: "e1ff3bfdd4e40315959b08b4fcc8245eaa514637e1d4ec2ae166b743341be1af".to_string(),
+            amount: 21,
+            time_period: "day".to_string(),
+            nwc: Some(NWC.to_string()),
+            created_at: chrono::NaiveDateTime::default(),
+            last_paid: None,
+            auth_index: None,
+        };
+        let out = format!("{config:?}");
+        assert!(out.contains("<redacted>"), "{out}");
+        assert!(!out.contains("secret="), "{out}");
+        assert!(!out.contains("nostr+walletconnect"), "{out}");
     }
 }
