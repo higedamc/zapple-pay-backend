@@ -59,8 +59,14 @@ pub struct SetUserConfig {
     pub donations: Option<Vec<DonationConfig>>,
 }
 
-/// Manual `Debug` so an NWC connection string (wallet spend authority) can never
-/// reach a log line through `{:?}`.
+/// Manual `Debug` with the NWC field redacted.
+///
+/// `NostrWalletConnectURI`'s derived `Debug` happens to be safe today only
+/// because `secp256k1::SecretKey` prints a hash fingerprint instead of the key
+/// (`impl_display_secret!`). That is an implementation detail of a transitive
+/// dependency, and the nostr crates are about to be bumped. The most dangerous
+/// value in this service should not rely on it: redact locally and keep the
+/// invariant under test (`debug_output_never_contains_nwc_secret`).
 impl std::fmt::Debug for SetUserConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SetUserConfig")
@@ -135,7 +141,7 @@ pub struct CreateUserSubscription {
     pub auth_id: Option<PublicKey>,
 }
 
-/// Manual `Debug`: see `SetUserConfig`.
+/// Manual `Debug` with the NWC field redacted; rationale on `SetUserConfig`.
 impl std::fmt::Debug for CreateUserSubscription {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CreateUserSubscription")

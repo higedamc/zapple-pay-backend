@@ -62,6 +62,27 @@ pub struct UserZapConfig {
     pub donations: Vec<Donation>,
 }
 
+/// Sanity check on the credential pair about to be written. Exactly one of
+/// `nwc` / `auth_index` must be set; `verify()` already enforces that at the
+/// API boundary, so reaching either branch is a bug worth an error line.
+///
+/// `nwc` is a full NWC connection string (wallet spend authority) and is
+/// deliberately never interpolated here: the upstream version of these two
+/// lines wrote `{nwc}` and leaked the secret into the log. The unit test
+/// `credential_shape_log_never_contains_nwc` captures the emitted record and
+/// goes red if the secret ever comes back.
+fn log_credential_shape(kind: &str, nwc: Option<&str>, auth_index: Option<i32>) {
+    match (nwc, auth_index) {
+        (None, None) => {
+            error!("{kind}.nwc and {kind}.auth_index are both None, this should never happen");
+        }
+        (Some(_), Some(auth_index)) => {
+            error!("{kind}.nwc and {kind}.auth_index ({auth_index}) are both Some, this should never happen");
+        }
+        _ => {} // expected
+    }
+}
+
 pub fn upsert_user(conn: &mut PgConnection, config: SetUserConfig) -> anyhow::Result<()> {
     conn.transaction::<_, Error, _>(|conn| {
         let auth_index = if let Some(pubkey) = config.auth_id {
@@ -90,15 +111,11 @@ pub fn upsert_user(conn: &mut PgConnection, config: SetUserConfig) -> anyhow::Re
             auth_index,
         };
 
-        match (zap_config.nwc.as_ref(), zap_config.auth_index.as_ref()) {
-            (None, None) => {
-                error!("zap_config.nwc and zap_config.auth_index are both None, this should never happen");
-            },
-            (Some(_nwc), Some(auth_index)) => {
-                error!("zap_config.nwc and zap_config.auth_index ({auth_index}) are both Some, this should never happen");
-            },
-            _ => {} // expected
-        }
+        log_credential_shape(
+            "zap_config",
+            zap_config.nwc.as_deref(),
+            zap_config.auth_index,
+        );
 
         let config_id: i32 = diesel::insert_into(schema::zap_configs::table)
             .values(&zap_config)
@@ -169,15 +186,11 @@ pub fn upsert_subscription(
             last_paid: None,
         };
 
-        match (sub_config.nwc.as_ref(), sub_config.auth_index.as_ref()) {
-            (None, None) => {
-                error!("sub_config.nwc and sub_config.auth_index are both None, this should never happen");
-            },
-            (Some(_nwc), Some(auth_index)) => {
-                error!("sub_config.nwc and sub_config.auth_index ({auth_index}) are both Some, this should never happen");
-            },
-            _ => {} // expected
-        }
+        log_credential_shape(
+            "sub_config",
+            sub_config.nwc.as_deref(),
+            sub_config.auth_index,
+        );
 
         diesel::insert_into(schema::subscription_configs::table)
             .values(&sub_config)
@@ -514,6 +527,72 @@ mod test {
     const PUBKEY: &str = "e1ff3bfdd4e40315959b08b4fcc8245eaa514637e1d4ec2ae166b743341be1af";
     const PUBKEY2: &str = "82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2";
     const NWC: &str = "nostr+walletconnect://246be70a7e4966f138e9e48401f33c32a1c428bbfb7aab42e3946beb8bc15e7c?relay=wss%3A%2F%2Frelay.damus.io%2F&secret=23ea701003500d852ba2756460099217f839e1fbc9665e493b56bd2d5912e31b";
+
+    /// Minimal `log::Log` that keeps every record so a test can inspect what
+    /// would have reached the real logger.
+    struct CaptureLogger;
+
+    static CAPTURED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            CAPTURED
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", record.level(), record.args()));
+        }
+        fn flush(&self) {}
+    }
+
+    /// Negative control for the upstream leak: the two `error!` lines in
+    /// `upsert_user` / `upsert_subscription` used to interpolate the NWC URI
+    /// via `Display`. Re-adding `{nwc}` to `log_credential_shape` turns this
+    /// red; the unrelated DB-backed tests stay green either way.
+    #[test]
+    fn credential_shape_log_never_contains_nwc() {
+        // set_logger may only succeed once per process; ignore a second call.
+        let _ = log::set_logger(&CAPTURE_LOGGER);
+        log::set_max_level(log::LevelFilter::Trace);
+        CAPTURED.lock().unwrap().clear();
+
+        let nwc = NostrWalletConnectURI::from_str(NWC).unwrap();
+        let secret_hex = nwc.secret.display_secret().to_string();
+        let nwc_string = nwc.to_string();
+        assert!(
+            nwc_string.contains(&secret_hex),
+            "fixture must carry the secret"
+        );
+
+        log_credential_shape("zap_config", Some(&nwc_string), Some(7));
+        log_credential_shape("sub_config", Some(&nwc_string), Some(8));
+        log_credential_shape("zap_config", None, None);
+        // the expected shapes must stay silent
+        log_credential_shape("zap_config", Some(&nwc_string), None);
+        log_credential_shape("zap_config", None, Some(9));
+
+        let lines = CAPTURED.lock().unwrap().clone();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].contains("zap_config") && lines[0].contains("(7)"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("sub_config") && lines[1].contains("(8)"),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[2].contains("both None"), "{}", lines[2]);
+        for line in &lines {
+            assert!(!line.contains(&secret_hex), "secret leaked: {line}");
+            assert!(!line.contains("secret="), "secret leaked: {line}");
+            assert!(!line.contains("nostr+walletconnect"), "URI leaked: {line}");
+        }
+    }
 
     fn init_db() -> PgConnection {
         dotenv::dotenv().ok();
