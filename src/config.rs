@@ -19,4 +19,12 @@ pub struct Config {
     #[clap(default_value_t = 3000, long)]
     /// Port for zapple-pay's webserver
     pub port: u16,
+    #[clap(long)]
+    /// Externally visible base URL of this API (e.g. https://185-18-221-23.sslip.io).
+    /// NIP-98 requests must be signed for this origin.
+    pub public_url: String,
+    #[clap(long)]
+    /// Pubkey (npub or hex) allowed to create/update/delete configs. Repeatable.
+    /// With no entries every mutation request is rejected.
+    pub allowed_npub: Vec<String>,
 }
