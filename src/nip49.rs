@@ -1,9 +1,10 @@
+use anyhow::anyhow;
 use chrono::{Datelike, Duration, NaiveDateTime, Timelike, Utc};
 use core::fmt;
 use itertools::Itertools;
 use nostr::key::PublicKey;
-use nostr::nips::nip47::{Error, Method};
-use nostr::prelude::url::form_urlencoded::byte_serialize;
+use nostr::nips::nip47::Method;
+use nostr::types::url::form_urlencoded::byte_serialize;
 use nostr::Url;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -82,7 +83,9 @@ impl SubscriptionPeriod {
             SubscriptionPeriod::Year => 86_400 * 365 * 5,
         };
 
-        NaiveDateTime::from_timestamp_opt(now - diff, 0).expect("Invalid timestamp")
+        chrono::DateTime::from_timestamp(now - diff, 0)
+            .expect("Invalid timestamp")
+            .naive_utc()
     }
 }
 
@@ -149,19 +152,19 @@ impl fmt::Display for NIP49Budget {
 }
 
 impl FromStr for NIP49Budget {
-    type Err = Error;
+    type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut split = s.split('/');
         let amount = split
             .next()
-            .ok_or(Error::InvalidURI)?
+            .ok_or(anyhow!("Invalid budget"))?
             .parse()
-            .map_err(|_| Error::InvalidURI)?;
+            .map_err(|_| anyhow!("Invalid budget amount"))?;
         let time_period = split
             .next()
-            .ok_or(Error::InvalidURI)?
+            .ok_or(anyhow!("Invalid budget"))?
             .parse()
-            .map_err(|_| Error::InvalidURI)?;
+            .map_err(|_| anyhow!("Invalid budget period"))?;
 
         Ok(Self {
             time_period,
@@ -190,12 +193,12 @@ pub struct NIP49URI {
 }
 
 impl FromStr for NIP49URI {
-    type Err = Error;
+    type Err = anyhow::Error;
     fn from_str(uri: &str) -> Result<Self, Self::Err> {
         let url = Url::parse(uri)?;
 
         if url.scheme() != NIP49_URI_SCHEME {
-            return Err(Error::InvalidURIScheme);
+            return Err(anyhow!("Invalid NWA URI scheme"));
         }
 
         if let Some(pubkey) = url.domain() {
@@ -239,7 +242,7 @@ impl FromStr for NIP49URI {
             }
 
             if required_commands.is_empty() {
-                return Err(Error::InvalidURI);
+                return Err(anyhow!("Invalid NWA URI: no required commands"));
             }
 
             if let Some((relay_url, secret)) = relay_url.zip(secret) {
@@ -255,7 +258,7 @@ impl FromStr for NIP49URI {
             }
         }
 
-        Err(Error::InvalidURI)
+        Err(anyhow!("Invalid NWA URI"))
     }
 }
 

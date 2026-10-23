@@ -1,6 +1,6 @@
 use crate::models::schema::zap_events::dsl;
 use crate::models::ConfigType;
-use chrono::NaiveDateTime;
+use chrono::{DateTime, NaiveDateTime};
 use diesel::dsl::sum;
 use diesel::prelude::*;
 use nostr::key::PublicKey;
@@ -153,8 +153,9 @@ impl ZapEvent {
         event_id: EventId,
         timestamp: Timestamp,
     ) -> anyhow::Result<ZapEvent> {
-        let time =
-            NaiveDateTime::from_timestamp_opt(timestamp.as_i64(), 0).expect("Invalid timestamp");
+        let time = DateTime::from_timestamp(timestamp.as_secs() as i64, 0)
+            .expect("Invalid timestamp")
+            .naive_utc();
         let zap_event = diesel::update(zap_events::table)
             .filter(zap_events::event_id.eq(event_id.to_hex()))
             .set(zap_events::paid_at.eq(time))

@@ -10,7 +10,7 @@ use crate::routes::*;
 use axum::http::{Method, StatusCode, Uri};
 use axum::routing::{get, post};
 use axum::{http, middleware, Extension, Router};
-use bitcoin::bip32::ExtendedPrivKey;
+use bitcoin::bip32::Xpriv;
 use bitcoin::Network;
 use clap::Parser;
 use diesel::r2d2::{ConnectionManager, Pool};
@@ -25,7 +25,6 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch::Sender;
@@ -54,11 +53,11 @@ pub fn build_router(state: State) -> Router {
         .route("/set-user", post(set_user_config))
         .route("/create-subscription", post(create_user_subscription))
         .route(
-            "/delete-subscription/:npub/:to_npub",
+            "/delete-subscription/{npub}/{to_npub}",
             post(delete_user_subscription),
         )
-        .route("/delete-user/:npub/:emoji", post(delete_user_config))
-        .route("/delete-user/:npub", post(delete_user_configs))
+        .route("/delete-user/{npub}/{emoji}", post(delete_user_config))
+        .route("/delete-user/{npub}", post(delete_user_configs))
         .route("/migrate-emojis", post(migrate_emojis))
         .route("/wallet-auth", post(wallet_auth))
         .route_layer(middleware::from_fn(auth::nip98_auth));
@@ -68,11 +67,11 @@ pub fn build_router(state: State) -> Router {
         .route("/check-wallet-auth", get(check_wallet_auth))
         .route("/count", get(count))
         .route("/relays", get(relays))
-        .route("/get-user/:npub/:emoji", get(get_user_config))
-        .route("/get-user/:npub", get(get_user_configs))
-        .route("/get-subscriptions/:npub", get(get_user_subscriptions))
+        .route("/get-user/{npub}/{emoji}", get(get_user_config))
+        .route("/get-user/{npub}", get(get_user_configs))
+        .route("/get-subscriptions/{npub}", get(get_user_subscriptions))
         .route(
-            "/get-subscriptions/:npub/:to_npub",
+            "/get-subscriptions/{npub}/{to_npub}",
             get(get_user_subscription),
         )
         .merge(protected)
@@ -96,7 +95,7 @@ pub struct State {
     secret_channel: Arc<Mutex<Sender<Vec<PublicKey>>>>,
     auth_channel: Arc<Mutex<Sender<Vec<PublicKey>>>>,
     pub server_keys: Keys,
-    pub xpriv: ExtendedPrivKey,
+    pub xpriv: Xpriv,
     pub auth: Arc<auth::Nip98Config>,
 }
 
@@ -148,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
     // convert to pubkeys and hex
     let mut secrets: Vec<PublicKey> = secrets
         .into_iter()
-        .map(|s| s.x_only_public_key(&SECP256K1).0.into())
+        .map(|s| s.x_only_public_key(SECP256K1).0.into())
         .collect();
     secrets.extend(auth_pubkeys);
 
@@ -177,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
     let addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
         .parse()
         .expect("Failed to parse bind/port for webserver");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
 
     info!("Webserver running on http://{addr}");
 
@@ -207,8 +207,6 @@ async fn main() -> anyhow::Result<()> {
 
         let _ = tx.send(());
     });
-
-    let server = axum::Server::bind(&addr).serve(server_router.into_make_service());
 
     // restart nostr connections every hour
     tokio::spawn(async move {
@@ -284,7 +282,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let graceful = server.with_graceful_shutdown(async {
+    let graceful = axum::serve(listener, server_router).with_graceful_shutdown(async {
         let _ = rx.await;
     });
 
@@ -312,21 +310,19 @@ impl ZapplePayKeys {
         let server_key = Keys::generate();
 
         ZapplePayKeys {
-            server_key: server_key
-                .secret_key()
-                .unwrap()
-                .to_bech32()
-                .expect("bech32"),
+            server_key: server_key.secret_key().to_bech32().expect("bech32"),
         }
     }
 
     fn server_keys(&self) -> Keys {
-        Keys::from_str(&self.server_key).expect("Could not parse secret key")
+        Keys::parse(&self.server_key).expect("Could not parse secret key")
     }
 
-    fn xprivkey(&self) -> ExtendedPrivKey {
-        let secret_bytes = SecretKey::parse(&self.server_key).unwrap().secret_bytes();
-        ExtendedPrivKey::new_master(Network::Bitcoin, &secret_bytes).unwrap()
+    fn xprivkey(&self) -> Xpriv {
+        let secret_bytes = SecretKey::parse(&self.server_key)
+            .unwrap()
+            .to_secret_bytes();
+        Xpriv::new_master(Network::Bitcoin, &secret_bytes).unwrap()
     }
 }
 

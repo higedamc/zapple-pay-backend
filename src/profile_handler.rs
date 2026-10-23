@@ -1,6 +1,6 @@
 use crate::LnUrlCacheResult;
 use anyhow::anyhow;
-use bitcoin::secp256k1::ThirtyTwoByteHash;
+use bitcoin::hashes::Hash;
 use lightning_invoice::Bolt11Invoice;
 use lnurl::lightning_address::LightningAddress;
 use lnurl::lnurl::LnUrl;
@@ -8,11 +8,13 @@ use lnurl::pay::PayResponse;
 use lnurl::LnUrlResponse::LnUrlPayResponse;
 use lnurl::{AsyncClient, Builder};
 use log::*;
-use nostr::nips::nip04::encrypt;
-use nostr::nips::nip47::{Method, NostrWalletConnectURI, Request, RequestParams};
-use nostr::prelude::{PayInvoiceRequestParams, ToBech32};
+use nostr::nips::nip47::{
+    Method, NostrWalletConnectURI, PayInvoiceRequest, Request, RequestParams,
+};
+use nostr::prelude::ToBech32;
 use nostr::{
-    Event, EventBuilder, EventId, JsonUtil, Keys, Kind, Metadata, PublicKey, Tag, Timestamp, Url,
+    Event, EventBuilder, EventId, JsonUtil, Keys, Kind, Metadata, PublicKey, RelayUrl, Tag,
+    TagStandard, Timestamp,
 };
 use nostr_sdk::Client;
 use serde_json::{json, Value};
@@ -39,7 +41,7 @@ pub async fn get_user_lnurl(
             Some(either) => match either {
                 LnUrlCacheResult::LnUrl((lnurl, timestamp)) => {
                     // if we got the lnurl more than 24 hours ago, return None
-                    if Timestamp::now().as_u64() - timestamp > 60 * 60 * 24 {
+                    if Timestamp::now().as_secs() - timestamp > 60 * 60 * 24 {
                         (None, None)
                     } else {
                         (Some((lnurl.clone(), None)), None)
@@ -47,7 +49,7 @@ pub async fn get_user_lnurl(
                 }
                 LnUrlCacheResult::MultipleLnUrl((lnurl, lnurl2, timestamp)) => {
                     // if we got the lnurl more than 24 hours ago, return None
-                    if Timestamp::now().as_u64() - timestamp > 60 * 60 * 24 {
+                    if Timestamp::now().as_secs() - timestamp > 60 * 60 * 24 {
                         (None, None)
                     } else {
                         (Some((lnurl.clone(), Some(lnurl2.clone()))), None)
@@ -91,7 +93,7 @@ pub async fn get_user_lnurl(
                     let mut cache = lnurl_cache.lock().await;
                     cache.insert(
                         user_key,
-                        LnUrlCacheResult::Timestamp(Timestamp::now().as_u64()),
+                        LnUrlCacheResult::Timestamp(Timestamp::now().as_secs()),
                     );
 
                     return Err(anyhow!("Profile has no lnurl or lightning address"));
@@ -100,7 +102,7 @@ pub async fn get_user_lnurl(
             };
 
             let mut cache = lnurl_cache.lock().await;
-            let now = Timestamp::now().as_u64();
+            let now = Timestamp::now().as_secs();
 
             match lnurl2.as_ref() {
                 None => cache.insert(user_key, LnUrlCacheResult::LnUrl((lnurl.clone(), now))),
@@ -168,26 +170,23 @@ async fn get_invoice_from_lnurl(
         Some(to_user) => {
             let mut tags = vec![
                 Tag::public_key(to_user),
-                Tag::Amount {
+                Tag::from_standardized(TagStandard::Amount {
                     millisats: amount_msats,
                     bolt11: None,
-                },
-                Tag::Lnurl(lnurl.to_string()),
-                Tag::Relays(vec!["wss://relay.damus.io".into()]),
+                }),
+                Tag::from_standardized(TagStandard::Lnurl(lnurl.to_string())),
+                Tag::relays(RelayUrl::parse("wss://relay.damus.io").ok()),
             ];
             if let Some(event_id) = event_id {
-                tags.push(Tag::Event {
-                    event_id,
-                    relay_url: None,
-                    marker: None,
-                });
+                tags.push(Tag::event(event_id));
             }
             if let Some(a_tag) = a_tag {
                 tags.push(a_tag);
             }
             let content = format!("From: nostr:{}", from_user.to_bech32().unwrap());
-            EventBuilder::new(Kind::ZapRequest, content, tags)
-                .to_event(keys)
+            EventBuilder::new(Kind::ZapRequest, content)
+                .tags(tags)
+                .sign_with_keys(keys)
                 .ok()
         }
     };
@@ -290,56 +289,47 @@ pub async fn pay_to_lnurl(
         },
     };
 
-    let event = create_nwc_request(&nwc, invoice.to_string());
+    let event = create_nwc_request(&nwc, invoice.to_string())?;
 
     let sent = SentInvoice {
-        payment_hash: invoice.payment_hash().into_32(),
+        payment_hash: invoice.payment_hash().to_byte_array(),
         event_id: event.id,
     };
 
+    let relay_url = crate::utils::nwc_relay(&nwc);
     match client {
-        Some(client) => client.send_event(event).await?,
+        Some(client) => {
+            client.send_event(&event).await?;
+        }
         None => {
-            let keys = Keys::new(nwc.secret);
-            let client = Client::new(&keys);
-
-            let relay_url =
-                if nwc.relay_url == Url::from_str("ws://alby-mainnet-nostr-relay/v1").unwrap() {
-                    Url::from_str("wss://relay.getalby.com/v1").unwrap()
-                } else {
-                    nwc.relay_url.clone()
-                };
+            let keys = Keys::new(nwc.secret.clone());
+            let client = Client::new(keys);
 
             client.add_relay(&relay_url).await?;
             client.connect().await;
 
-            let id = client.send_event(event).await?;
-            client.disconnect().await?;
-
-            id
+            client.send_event(&event).await?;
+            client.disconnect().await;
         }
     };
 
-    debug!("Sent event to {}", nwc.relay_url);
+    debug!("Sent event to {relay_url}");
     Ok(sent)
 }
 
-fn create_nwc_request(nwc: &NostrWalletConnectURI, invoice: String) -> Event {
+/// Build the NIP-47 `pay_invoice` request event, NIP-04 encrypted to the
+/// wallet service and signed with the connection secret (as upstream did).
+fn create_nwc_request(nwc: &NostrWalletConnectURI, invoice: String) -> anyhow::Result<Event> {
     let req = Request {
         method: Method::PayInvoice,
-        params: RequestParams::PayInvoice(PayInvoiceRequestParams {
+        params: RequestParams::PayInvoice(PayInvoiceRequest {
             id: None,
             invoice,
             amount: None,
         }),
     };
 
-    let encrypted = encrypt(&nwc.secret, &nwc.public_key, req.as_json()).unwrap();
-    let p_tag = Tag::public_key(nwc.public_key);
-
-    EventBuilder::new(Kind::WalletConnectRequest, encrypted, [p_tag])
-        .to_event(&Keys::new(nwc.secret.clone()))
-        .unwrap()
+    Ok(req.to_event(nwc)?)
 }
 
 async fn get_nostr_profile(

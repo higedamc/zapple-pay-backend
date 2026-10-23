@@ -517,12 +517,12 @@ mod test {
     use super::*;
     use crate::nip49::SubscriptionPeriod;
     use crate::routes::DonationConfig;
-    use bitcoin::bip32::ExtendedPrivKey;
+    use bitcoin::bip32::Xpriv;
     use bitcoin::Network;
-    use chrono::{NaiveDateTime, Utc};
+    use chrono::{DateTime, Utc};
     use diesel_migrations::MigrationHarness;
     use nostr::prelude::NostrWalletConnectURI;
-    use nostr::{EventId, Timestamp, SECP256K1};
+    use nostr::{EventId, RelayUrl, Timestamp, SECP256K1};
 
     const PUBKEY: &str = "e1ff3bfdd4e40315959b08b4fcc8245eaa514637e1d4ec2ae166b743341be1af";
     const PUBKEY2: &str = "82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2";
@@ -560,7 +560,7 @@ mod test {
         CAPTURED.lock().unwrap().clear();
 
         let nwc = NostrWalletConnectURI::from_str(NWC).unwrap();
-        let secret_hex = nwc.secret.display_secret().to_string();
+        let secret_hex = nwc.secret.to_secret_hex();
         let nwc_string = nwc.to_string();
         assert!(
             nwc_string.contains(&secret_hex),
@@ -626,7 +626,7 @@ mod test {
         let npub = PublicKey::from_str(PUBKEY).unwrap();
         let to_npub = PublicKey::from_str(PUBKEY2).unwrap();
         let nwc = NostrWalletConnectURI::from_str(NWC).unwrap();
-        let xpriv = ExtendedPrivKey::new_master(Network::Bitcoin, &[0; 32]).unwrap();
+        let xpriv = Xpriv::new_master(Network::Bitcoin, &[0; 32]).unwrap();
 
         let config = CreateUserSubscription {
             npub,
@@ -655,7 +655,7 @@ mod test {
 
         let npub = PublicKey::from_str(PUBKEY).unwrap();
         let to_npub = PublicKey::from_str(PUBKEY2).unwrap();
-        let xpriv = ExtendedPrivKey::new_master(Network::Bitcoin, &[0; 32]).unwrap();
+        let xpriv = Xpriv::new_master(Network::Bitcoin, &[0; 32]).unwrap();
 
         // setup wallet auth
         let wallet_auth = WalletAuth::create(&mut conn, xpriv).unwrap();
@@ -683,7 +683,10 @@ mod test {
         assert_eq!(config.time_period(), SubscriptionPeriod::Day);
         let nwc = config.nwc(xpriv, Some(user_pubkey), None);
         assert_eq!(nwc.public_key, user_pubkey);
-        assert_eq!(nwc.secret.x_only_public_key(&SECP256K1).0, *auth_id);
+        assert_eq!(
+            PublicKey::from(nwc.secret.x_only_public_key(SECP256K1).0),
+            auth_id
+        );
 
         clear_database(&mut conn)
     }
@@ -695,7 +698,7 @@ mod test {
         let npub = PublicKey::from_str(PUBKEY).unwrap();
         let to_npub = PublicKey::from_str(PUBKEY2).unwrap();
         let nwc = NostrWalletConnectURI::from_str(NWC).unwrap();
-        let xpriv = ExtendedPrivKey::new_master(Network::Bitcoin, &[0; 32]).unwrap();
+        let xpriv = Xpriv::new_master(Network::Bitcoin, &[0; 32]).unwrap();
 
         // create subscription with nwc
         let config = CreateUserSubscription {
@@ -733,8 +736,14 @@ mod test {
         assert_eq!(config.time_period(), SubscriptionPeriod::Week);
         let new_nwc = config.nwc(xpriv, Some(user_pubkey), Some(&relay));
         assert_eq!(new_nwc.public_key, user_pubkey);
-        assert_eq!(new_nwc.secret.x_only_public_key(&SECP256K1).0, *auth_id);
-        assert_eq!(new_nwc.relay_url.to_string(), relay);
+        assert_eq!(
+            PublicKey::from(new_nwc.secret.x_only_public_key(SECP256K1).0),
+            auth_id
+        );
+        assert_eq!(
+            crate::utils::nwc_relay(&new_nwc),
+            RelayUrl::parse(&relay).unwrap()
+        );
         assert_ne!(new_nwc, nwc);
 
         clear_database(&mut conn)
@@ -746,7 +755,7 @@ mod test {
         let npub = PublicKey::from_str(PUBKEY).unwrap();
         let to_npub = PublicKey::from_str(PUBKEY2).unwrap();
         let nwc = NostrWalletConnectURI::from_str(NWC).unwrap();
-        let xpriv = ExtendedPrivKey::new_master(Network::Bitcoin, &[0; 32]).unwrap();
+        let xpriv = Xpriv::new_master(Network::Bitcoin, &[0; 32]).unwrap();
 
         // create a subscription
         let config = CreateUserSubscription {
@@ -848,7 +857,7 @@ mod test {
         let npub = PublicKey::from_str(PUBKEY).unwrap();
         let to_npub = PublicKey::from_str(PUBKEY2).unwrap();
         let nwc = NostrWalletConnectURI::from_str(NWC).unwrap();
-        let xpriv = ExtendedPrivKey::new_master(Network::Bitcoin, &[0; 32]).unwrap();
+        let xpriv = Xpriv::new_master(Network::Bitcoin, &[0; 32]).unwrap();
 
         // create a zap config
         let emoji = "🍕".to_string();
@@ -957,7 +966,7 @@ mod test {
         let npub = PublicKey::from_str(PUBKEY).unwrap();
         let to_npub = PublicKey::from_str(PUBKEY2).unwrap();
         let nwc = NostrWalletConnectURI::from_str(NWC).unwrap();
-        let xpriv = ExtendedPrivKey::new_master(Network::Bitcoin, &[0; 32]).unwrap();
+        let xpriv = Xpriv::new_master(Network::Bitcoin, &[0; 32]).unwrap();
 
         let config = CreateUserSubscription {
             npub,
@@ -994,8 +1003,9 @@ mod test {
 
         // set last paid to 1.5 periods ago
         let diff: i64 = (86_400.0 * 1.5) as i64;
-        let small_time_ago = NaiveDateTime::from_timestamp_opt(now.timestamp() - diff, 0)
-            .expect("Invalid timestamp");
+        let small_time_ago = DateTime::from_timestamp(now.timestamp() - diff, 0)
+            .expect("Invalid timestamp")
+            .naive_utc();
         diesel::update(schema::subscription_configs::table)
             .set(schema::subscription_configs::last_paid.eq(Some(small_time_ago)))
             .execute(&mut conn)
@@ -1007,8 +1017,9 @@ mod test {
 
         // set last paid to 6 periods ago
         let diff: i64 = 86_400 * 6;
-        let too_far_ago = NaiveDateTime::from_timestamp_opt(now.timestamp() - diff, 0)
-            .expect("Invalid timestamp");
+        let too_far_ago = DateTime::from_timestamp(now.timestamp() - diff, 0)
+            .expect("Invalid timestamp")
+            .naive_utc();
         diesel::update(schema::subscription_configs::table)
             .set(schema::subscription_configs::last_paid.eq(Some(too_far_ago)))
             .execute(&mut conn)

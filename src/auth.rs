@@ -12,15 +12,19 @@
 //! a request extension (`AuthedPubkey`) for the handler.
 
 use crate::State;
-use axum::body::{Body, Bytes, HttpBody};
-use axum::http::{header, Request, StatusCode};
+use axum::body::{Body, Bytes};
+use axum::extract::Request;
+use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use bitcoin::hashes::{sha256, Hash};
+use http_body_util::BodyExt;
 use log::warn;
 use nostr::nips::nip19::FromBech32;
-use nostr::{Event, EventId, JsonUtil, Kind, PublicKey, Tag, Timestamp};
+use nostr::{
+    Alphabet, Event, EventId, JsonUtil, Kind, PublicKey, SingleLetterTag, TagKind, Timestamp,
+};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
@@ -89,8 +93,8 @@ impl Nip98Config {
     /// stays bounded by the request rate within the window.
     fn remember(&self, id: EventId, created_at: Timestamp, now: Timestamp) -> bool {
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-        let cutoff = now.as_u64().saturating_sub(MAX_CLOCK_SKEW_SECS);
-        seen.retain(|_, ts| ts.as_u64() >= cutoff);
+        let cutoff = now.as_secs().saturating_sub(MAX_CLOCK_SKEW_SECS);
+        seen.retain(|_, ts| ts.as_secs() >= cutoff);
         seen.insert(id, created_at).is_none()
     }
 }
@@ -187,13 +191,13 @@ pub fn verify_nip98(
     let json = base64_decode(token.trim()).ok_or(AuthError::MalformedHeader)?;
     let event = Event::from_json(json).map_err(|_| AuthError::InvalidEvent)?;
 
-    if event.kind() != Kind::HttpAuth {
+    if event.kind != Kind::HttpAuth {
         return Err(AuthError::WrongKind);
     }
     event.verify().map_err(|_| AuthError::BadSignature)?;
 
-    let created = event.created_at().as_u64();
-    let now_s = now.as_u64();
+    let created = event.created_at.as_secs();
+    let now_s = now.as_secs();
     if created.abs_diff(now_s) > MAX_CLOCK_SKEW_SECS {
         return Err(AuthError::Expired);
     }
@@ -201,11 +205,17 @@ pub fn verify_nip98(
     let mut tag_url: Option<String> = None;
     let mut tag_method: Option<String> = None;
     let mut tag_payload: Option<String> = None;
-    for tag in event.tags() {
-        match tag {
-            Tag::AbsoluteURL(u) => tag_url = Some(u.to_string()),
-            Tag::Method(m) => tag_method = Some(m.to_string()),
-            Tag::Payload(p) => tag_payload = Some(p.to_string()),
+    // Raw tag values, compared as strings: the `u` tag must match the URL the
+    // server was reached at byte for byte (no URL normalisation on either
+    // side), exactly as before the nostr crate bump.
+    for tag in event.tags.iter() {
+        match tag.kind() {
+            TagKind::SingleLetter(SingleLetterTag {
+                character: Alphabet::U,
+                uppercase: false,
+            }) => tag_url = tag.content().map(str::to_string),
+            TagKind::Method => tag_method = tag.content().map(str::to_string),
+            TagKind::Payload => tag_payload = tag.content().map(str::to_string),
             _ => {}
         }
     }
@@ -233,12 +243,12 @@ pub fn verify_nip98(
     }
 
     // Allowlist before the replay cache so unknown keys never occupy it.
-    let pubkey = event.author();
+    let pubkey = event.pubkey;
     if !config.is_allowed(&pubkey) {
         return Err(AuthError::NotAllowed);
     }
 
-    if !config.remember(event.id(), event.created_at(), now) {
+    if !config.remember(event.id, event.created_at, now) {
         return Err(AuthError::Replay);
     }
 
@@ -294,11 +304,7 @@ pub fn require_owner(auth: &AuthedPubkey, npub: &PublicKey) -> Result<(), (Statu
 
 /// axum middleware: buffer the body (bounded), verify NIP-98 + allowlist,
 /// then forward the request with the body restored and `AuthedPubkey` set.
-pub async fn nip98_auth(
-    Extension(state): Extension<State>,
-    req: Request<Body>,
-    next: Next<Body>,
-) -> Response {
+pub async fn nip98_auth(Extension(state): Extension<State>, req: Request, next: Next) -> Response {
     let (parts, body) = req.into_parts();
 
     let body_bytes = match read_body(body).await {
@@ -339,12 +345,14 @@ pub async fn nip98_auth(
 
 async fn read_body(mut body: Body) -> Result<Bytes, AuthError> {
     let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = body.data().await {
-        let chunk = chunk.map_err(|_| AuthError::MalformedHeader)?;
-        if buf.len() + chunk.len() > MAX_BODY_BYTES {
-            return Err(AuthError::BodyTooLarge);
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| AuthError::MalformedHeader)?;
+        if let Ok(chunk) = frame.into_data() {
+            if buf.len() + chunk.len() > MAX_BODY_BYTES {
+                return Err(AuthError::BodyTooLarge);
+            }
+            buf.extend_from_slice(&chunk);
         }
-        buf.extend_from_slice(&chunk);
     }
     Ok(Bytes::from(buf))
 }
@@ -353,8 +361,8 @@ async fn read_body(mut body: Body) -> Result<Bytes, AuthError> {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
-    use nostr::nips::nip98::HttpData;
-    use nostr::{EventBuilder, HttpMethod, Keys, UncheckedUrl};
+    use nostr::nips::nip98::{HttpData, HttpMethod};
+    use nostr::{EventBuilder, Keys, Url};
 
     pub(crate) fn b64(bytes: &[u8]) -> String {
         const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -390,13 +398,13 @@ pub(crate) mod test_support {
         body: Option<&[u8]>,
         at: Timestamp,
     ) -> String {
-        let mut data = HttpData::new(UncheckedUrl::from(url), method);
+        let mut data = HttpData::new(Url::parse(url).unwrap(), method);
         if let Some(b) = body {
             data = data.payload(sha256::Hash::hash(b));
         }
         let event = EventBuilder::http_auth(data)
             .custom_created_at(at)
-            .to_event(keys)
+            .sign_with_keys(keys)
             .unwrap();
         format!("Nostr {}", b64(event.as_json().as_bytes()))
     }
@@ -406,8 +414,8 @@ pub(crate) mod test_support {
 mod test {
     use super::test_support::{b64, header};
     use super::*;
-    use nostr::nips::nip98::HttpData;
-    use nostr::{EventBuilder, HttpMethod, Keys, UncheckedUrl};
+    use nostr::nips::nip98::{HttpData, HttpMethod};
+    use nostr::{EventBuilder, Keys, Tag, Url};
 
     const PUBLIC_URL: &str = "https://185-18-221-23.sslip.io";
 
@@ -487,11 +495,12 @@ mod test {
         let cfg = config_for(&[&keys]);
         let now = Timestamp::now();
         let url = format!("{PUBLIC_URL}/set-user");
-        let data = HttpData::new(UncheckedUrl::from(url.as_str()), HttpMethod::POST);
+        let data = HttpData::new(Url::parse(&url).unwrap(), HttpMethod::POST);
         let tags: Vec<Tag> = data.into();
-        let event = EventBuilder::new(Kind::TextNote, "", tags)
+        let event = EventBuilder::new(Kind::TextNote, "")
+            .tags(tags)
             .custom_created_at(now)
-            .to_event(&keys)
+            .sign_with_keys(&keys)
             .unwrap();
         let h = format!("Nostr {}", b64(event.as_json().as_bytes()));
         assert_eq!(
@@ -506,10 +515,10 @@ mod test {
         let cfg = config_for(&[&keys]);
         let now = Timestamp::now();
         let url = format!("{PUBLIC_URL}/set-user");
-        let data = HttpData::new(UncheckedUrl::from(url.as_str()), HttpMethod::POST);
+        let data = HttpData::new(Url::parse(&url).unwrap(), HttpMethod::POST);
         let event = EventBuilder::http_auth(data)
             .custom_created_at(now)
-            .to_event(&keys)
+            .sign_with_keys(&keys)
             .unwrap();
         // Flip the content after signing: id/sig no longer match.
         let mut v: serde_json::Value = serde_json::from_str(&event.as_json()).unwrap();
@@ -527,20 +536,20 @@ mod test {
         let cfg = config_for(&[&keys]);
         let now = Timestamp::now();
         let url = format!("{PUBLIC_URL}/set-user");
-        let old = Timestamp::from(now.as_u64() - MAX_CLOCK_SKEW_SECS - 1);
+        let old = Timestamp::from_secs(now.as_secs() - MAX_CLOCK_SKEW_SECS - 1);
         let h = header(&keys, HttpMethod::POST, &url, None, old);
         assert_eq!(
             verify_nip98(&cfg, Some(&h), "POST", &url, b"", now),
             Err(AuthError::Expired)
         );
-        let future = Timestamp::from(now.as_u64() + MAX_CLOCK_SKEW_SECS + 1);
+        let future = Timestamp::from_secs(now.as_secs() + MAX_CLOCK_SKEW_SECS + 1);
         let h = header(&keys, HttpMethod::POST, &url, None, future);
         assert_eq!(
             verify_nip98(&cfg, Some(&h), "POST", &url, b"", now),
             Err(AuthError::Expired)
         );
         // Edge: exactly at the boundary is still accepted.
-        let edge = Timestamp::from(now.as_u64() - MAX_CLOCK_SKEW_SECS);
+        let edge = Timestamp::from_secs(now.as_secs() - MAX_CLOCK_SKEW_SECS);
         let h = header(&keys, HttpMethod::POST, &url, None, edge);
         assert!(verify_nip98(&cfg, Some(&h), "POST", &url, b"", now).is_ok());
     }
@@ -652,7 +661,7 @@ mod test {
         );
         // After the window has passed the id is pruned and the event is
         // rejected as expired, not replayed; either way it cannot be reused.
-        let later = Timestamp::from(now.as_u64() + MAX_CLOCK_SKEW_SECS + 1);
+        let later = Timestamp::from_secs(now.as_secs() + MAX_CLOCK_SKEW_SECS + 1);
         assert_eq!(
             verify_nip98(&cfg, Some(&h), "POST", &url, b"", later),
             Err(AuthError::Expired)
