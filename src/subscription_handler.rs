@@ -7,7 +7,7 @@ use crate::models::{schema, ConfigType};
 use crate::profile_handler::SentInvoice;
 use crate::LnUrlCacheResult;
 use anyhow::anyhow;
-use bitcoin::bip32::ExtendedPrivKey;
+use bitcoin::bip32::Xpriv;
 use chrono::{Timelike, Utc};
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::{Connection, ExpressionMethods, PgConnection, RunQueryDsl};
@@ -28,7 +28,7 @@ use tokio::sync::Mutex;
 
 pub async fn start_subscription_handler(
     keys: Keys,
-    xpriv: ExtendedPrivKey,
+    xpriv: Xpriv,
     db_pool: Pool<ConnectionManager<PgConnection>>,
     lnurl_cache: Arc<Mutex<HashMap<PublicKey, LnUrlCacheResult>>>,
     pay_cache: Arc<Mutex<HashMap<LnUrl, PayResponse>>>,
@@ -114,9 +114,9 @@ pub async fn start_subscription_handler(
                 continue;
             }
 
-            let client = Client::new(&keys);
+            let client = Client::new(keys.clone());
 
-            client.add_relay(relay).await?;
+            client.add_relay(&relay).await?;
             client.connect().await;
 
             let mut first = true;
@@ -149,7 +149,7 @@ pub async fn start_subscription_handler(
                 }
             }
 
-            client.disconnect().await?;
+            client.disconnect().await;
         }
         let num_successful = successful.len();
         let num_failed = total - num_successful;
@@ -264,7 +264,8 @@ async fn pay_subscription(
         Err(e) => {
             error!(
                 "Error paying to lnurl {tried_lnurl} {amount_msats} msats on {} for subscription {}: {e}",
-                nwc.relay_url.to_string(), sub.id
+                crate::utils::nwc_relay(&nwc),
+                sub.id
             );
         }
         Ok(res) => successful.push((res, nwc, sub)),

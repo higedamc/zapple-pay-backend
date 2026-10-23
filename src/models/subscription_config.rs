@@ -1,10 +1,10 @@
 use crate::nip49::{SubscriptionPeriod, ALL_SUBSCRIPTION_PERIODS};
 use crate::DEFAULT_AUTH_RELAY;
-use bitcoin::bip32::{ChildNumber, ExtendedPrivKey};
+use bitcoin::bip32::{ChildNumber, Xpriv};
 use diesel::prelude::*;
 use nostr::key::PublicKey;
 use nostr::prelude::{NostrWalletConnectURI, SecretKey};
-use nostr::{Url, SECP256K1};
+use nostr::{RelayUrl, SECP256K1};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -83,7 +83,7 @@ impl SubscriptionConfig {
 
     pub fn nwc(
         &self,
-        xpriv: ExtendedPrivKey,
+        xpriv: Xpriv,
         user_public_key: Option<PublicKey>,
         relay: Option<&str>,
     ) -> NostrWalletConnectURI {
@@ -92,7 +92,7 @@ impl SubscriptionConfig {
             (None, Some(index)) => {
                 let secret = xpriv
                     .derive_priv(
-                        &SECP256K1,
+                        SECP256K1,
                         &[ChildNumber::from_hardened_idx(index as u32).unwrap()],
                     )
                     .unwrap()
@@ -100,7 +100,7 @@ impl SubscriptionConfig {
 
                 NostrWalletConnectURI::new(
                     user_public_key.expect("Missing user public key from database"),
-                    Url::parse(relay.unwrap_or(DEFAULT_AUTH_RELAY)).unwrap(),
+                    vec![crate::utils::relay_or_default(relay)],
                     secret.into(),
                     None,
                 )
@@ -109,18 +109,12 @@ impl SubscriptionConfig {
         }
     }
 
-    pub fn relay_url(&self) -> Url {
-        let url = self
-            .nwc
+    pub fn relay_url(&self) -> RelayUrl {
+        self.nwc
             .as_deref()
-            .map(|s| NostrWalletConnectURI::from_str(s).unwrap().relay_url)
-            .unwrap_or(Url::from_str(DEFAULT_AUTH_RELAY).expect("invalid relay url"));
-
-        if url == Url::from_str("ws://alby-mainnet-nostr-relay/v1").unwrap() {
-            Url::from_str("wss://relay.getalby.com/v1").unwrap()
-        } else {
-            url
-        }
+            .and_then(|s| NostrWalletConnectURI::from_str(s).ok())
+            .map(|nwc| crate::utils::nwc_relay(&nwc))
+            .unwrap_or_else(|| RelayUrl::parse(DEFAULT_AUTH_RELAY).expect("invalid relay url"))
     }
 
     pub fn amount_msats(&self) -> u64 {
@@ -238,17 +232,17 @@ impl SubscriptionConfig {
             .collect())
     }
 
-    pub fn get_nwc_relays(conn: &mut PgConnection) -> anyhow::Result<HashMap<Url, usize>> {
+    pub fn get_nwc_relays(conn: &mut PgConnection) -> anyhow::Result<HashMap<RelayUrl, usize>> {
         let strings: Vec<Option<String>> = subscription_configs::table
             .select(subscription_configs::nwc)
             .filter(subscription_configs::nwc.is_not_null())
             .distinct()
             .load(conn)?;
-        let relays: Vec<Url> = strings
+        let relays: Vec<RelayUrl> = strings
             .into_iter()
             .flatten()
             .filter_map(|s| NostrWalletConnectURI::from_str(&s).ok())
-            .map(|nwc| nwc.relay_url)
+            .map(|nwc| crate::utils::nwc_relay(&nwc))
             .filter(|u| !u.to_string().contains("mutinywallet")) // these are dead/old
             .collect();
 
@@ -308,6 +302,30 @@ mod test {
         assert!(out.contains("<redacted>"), "{out}");
         assert!(!out.contains("secret="), "{out}");
         assert!(!out.contains("nostr+walletconnect"), "{out}");
+    }
+
+    /// A relay string the wallet sent that is not a `ws(s)://` URL must not
+    /// panic the subscription loop; the default auth relay is used instead.
+    #[test]
+    fn nwa_nwc_with_unparseable_relay_falls_back_to_default() {
+        let xpriv = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Bitcoin, &[0; 32]).unwrap();
+        let config = SubscriptionConfig {
+            id: 1,
+            user_id: 1,
+            to_npub: "e1ff3bfdd4e40315959b08b4fcc8245eaa514637e1d4ec2ae166b743341be1af".to_string(),
+            amount: 21,
+            time_period: "day".to_string(),
+            nwc: None,
+            created_at: chrono::NaiveDateTime::default(),
+            last_paid: None,
+            auth_index: Some(3),
+        };
+        let user = PublicKey::from_slice(&[2; 32]).unwrap();
+        let nwc = config.nwc(xpriv, Some(user), Some("relay.example"));
+        assert_eq!(
+            nwc.relays,
+            vec![RelayUrl::parse(DEFAULT_AUTH_RELAY).unwrap()]
+        );
     }
 
     /// Wire-side twin of the Debug test: the raw NWC string must never be

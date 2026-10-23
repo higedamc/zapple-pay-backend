@@ -1,11 +1,10 @@
 use crate::models::schema::zap_configs::dsl;
 use crate::utils::map_emoji;
-use crate::DEFAULT_AUTH_RELAY;
-use bitcoin::bip32::{ChildNumber, ExtendedPrivKey};
+use bitcoin::bip32::{ChildNumber, Xpriv};
 use diesel::prelude::*;
 use nostr::prelude::NostrWalletConnectURI;
 use nostr::SecretKey;
-use nostr::{PublicKey, Url, SECP256K1};
+use nostr::{PublicKey, RelayUrl, SECP256K1};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -70,7 +69,7 @@ pub struct NewZapConfig<'a> {
 impl ZapConfig {
     pub fn nwc(
         &self,
-        xpriv: ExtendedPrivKey,
+        xpriv: Xpriv,
         user_public_key: Option<PublicKey>,
         relay: Option<&str>,
     ) -> NostrWalletConnectURI {
@@ -79,7 +78,7 @@ impl ZapConfig {
             (None, Some(index)) => {
                 let secret = xpriv
                     .derive_priv(
-                        &SECP256K1,
+                        SECP256K1,
                         &[ChildNumber::from_hardened_idx(index as u32).unwrap()],
                     )
                     .unwrap()
@@ -87,7 +86,7 @@ impl ZapConfig {
 
                 NostrWalletConnectURI::new(
                     user_public_key.expect("Missing user public key from database"),
-                    Url::parse(relay.unwrap_or(DEFAULT_AUTH_RELAY)).unwrap(),
+                    vec![crate::utils::relay_or_default(relay)],
                     secret.into(),
                     None,
                 )
@@ -124,17 +123,17 @@ impl ZapConfig {
         Ok(secrets)
     }
 
-    pub fn get_nwc_relays(conn: &mut PgConnection) -> anyhow::Result<HashMap<Url, usize>> {
+    pub fn get_nwc_relays(conn: &mut PgConnection) -> anyhow::Result<HashMap<RelayUrl, usize>> {
         let strings: Vec<Option<String>> = zap_configs::table
             .select(zap_configs::nwc)
             .filter(zap_configs::nwc.is_not_null())
             .distinct()
             .load(conn)?;
-        let relays: Vec<Url> = strings
+        let relays: Vec<RelayUrl> = strings
             .into_iter()
             .flatten()
             .filter_map(|s| NostrWalletConnectURI::from_str(&s).ok())
-            .map(|nwc| nwc.relay_url)
+            .map(|nwc| crate::utils::nwc_relay(&nwc))
             .filter(|u| !u.to_string().contains("mutinywallet")) // these are dead/old
             .collect();
 
@@ -228,6 +227,34 @@ mod test {
         assert!(out.contains("<redacted>"), "{out}");
         assert!(!out.contains("secret="), "{out}");
         assert!(!out.contains("nostr+walletconnect"), "{out}");
+    }
+
+    /// A relay string the wallet sent that is not a `ws(s)://` URL must not
+    /// panic the payment path; the default auth relay is used instead.
+    #[test]
+    fn nwa_nwc_with_unparseable_relay_falls_back_to_default() {
+        let xpriv = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Bitcoin, &[0; 32]).unwrap();
+        let config = ZapConfig {
+            id: 1,
+            user_id: 1,
+            emoji: "⚡".to_string(),
+            amount: 21,
+            nwc: None,
+            created_at: chrono::NaiveDateTime::default(),
+            auth_index: Some(3),
+        };
+        let user = PublicKey::from_slice(&[2; 32]).unwrap();
+        let nwc = config.nwc(xpriv, Some(user), Some("https://not-a-relay.example/x"));
+        assert_eq!(nwc.public_key, user);
+        assert_eq!(
+            nwc.relays,
+            vec![RelayUrl::parse(crate::DEFAULT_AUTH_RELAY).unwrap()]
+        );
+        let kept = config.nwc(xpriv, Some(user), Some("wss://wallet.example/"));
+        assert_eq!(
+            kept.relays,
+            vec![RelayUrl::parse("wss://wallet.example/").unwrap()]
+        );
     }
 
     /// Wire-side twin of the Debug test: the raw NWC string must never be

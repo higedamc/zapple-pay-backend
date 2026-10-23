@@ -20,7 +20,7 @@ use nostr::nips::nip47::NostrWalletConnectURI;
 use nostr::prelude::Method;
 #[cfg(not(test))]
 use nostr::prelude::ToBech32;
-use nostr::{Keys, Url, SECP256K1};
+use nostr::{Keys, RelayUrl, Url, SECP256K1};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -175,6 +175,34 @@ impl CreateUserSubscription {
     }
 }
 
+/// Legacy NIP-04 direct message (kind 4), exactly what upstream sent. The SDK
+/// dropped its kind-4 helper in favour of NIP-17 gift wraps, which need the
+/// recipient's kind 10050 relay list and are not shown by every client, so
+/// the event is built by hand to keep the behaviour.
+pub(crate) fn build_nip04_dm(
+    keys: &Keys,
+    npub: PublicKey,
+    content: &str,
+) -> anyhow::Result<nostr::Event> {
+    let encrypted = nostr::nips::nip04::encrypt(keys.secret_key(), &npub, content)?;
+    Ok(
+        nostr::EventBuilder::new(nostr::Kind::EncryptedDirectMessage, encrypted)
+            .tag(nostr::Tag::public_key(npub))
+            .sign_with_keys(keys)?,
+    )
+}
+
+#[cfg(not(test))]
+async fn send_nip04_dm(
+    client: &nostr_sdk::Client,
+    keys: &Keys,
+    npub: PublicKey,
+    content: String,
+) -> anyhow::Result<nostr::EventId> {
+    let event = build_nip04_dm(keys, npub, &content)?;
+    Ok(client.send_event(&event).await?.val)
+}
+
 #[cfg(not(test))]
 async fn send_config_dm(
     keys: Keys,
@@ -182,16 +210,16 @@ async fn send_config_dm(
     emoji: String,
     amt: u64,
 ) -> anyhow::Result<()> {
-    let client = nostr_sdk::Client::new(&keys);
+    let client = nostr_sdk::Client::new(keys.clone());
     client.add_relay("wss://relay.damus.io").await?;
     client.connect().await;
 
     let sats = if amt == 1 { "sat" } else { "sats" };
     let content = format!("You have configured Zapple Pay to zap {amt} {sats} anytime you react to a note with a {emoji} emoji!");
 
-    let event_id = client.send_direct_msg(npub, content, None).await?;
-    debug!("Sent DM: {event_id}");
-    client.disconnect().await?;
+    let sent = send_nip04_dm(&client, &keys, npub, content).await?;
+    debug!("Sent DM: {sent}");
+    client.disconnect().await;
 
     Ok(())
 }
@@ -204,7 +232,7 @@ async fn send_subscription_dm(
     period: SubscriptionPeriod,
     amt: u64,
 ) -> anyhow::Result<()> {
-    let client = nostr_sdk::Client::new(&keys);
+    let client = nostr_sdk::Client::new(keys.clone());
     client.add_relay("wss://relay.damus.io").await?;
     client.connect().await;
 
@@ -214,25 +242,25 @@ async fn send_subscription_dm(
         to_npub.to_bech32().expect("bech32")
     );
 
-    let event_id = client.send_direct_msg(npub, content, None).await?;
-    debug!("Sent DM: {event_id}");
-    client.disconnect().await?;
+    let sent = send_nip04_dm(&client, &keys, npub, content).await?;
+    debug!("Sent DM: {sent}");
+    client.disconnect().await;
 
     Ok(())
 }
 
 #[cfg(not(test))]
 async fn send_deleted_config_dm(keys: Keys, npub: PublicKey, emoji: String) -> anyhow::Result<()> {
-    let client = nostr_sdk::Client::new(&keys);
+    let client = nostr_sdk::Client::new(keys.clone());
     client.add_relay("wss://relay.damus.io").await?;
     client.connect().await;
 
     let content =
         format!("You have deleted your Zapple Pay config for reactions with a {emoji} emoji!");
 
-    let event_id = client.send_direct_msg(npub, content, None).await?;
-    debug!("Sent DM: {event_id}");
-    client.disconnect().await?;
+    let sent = send_nip04_dm(&client, &keys, npub, content).await?;
+    debug!("Sent DM: {sent}");
+    client.disconnect().await;
 
     Ok(())
 }
@@ -243,7 +271,7 @@ async fn send_deleted_subscription_dm(
     npub: PublicKey,
     to_npub: PublicKey,
 ) -> anyhow::Result<()> {
-    let client = nostr_sdk::Client::new(&keys);
+    let client = nostr_sdk::Client::new(keys.clone());
     client.add_relay("wss://relay.damus.io").await?;
     client.connect().await;
 
@@ -252,24 +280,24 @@ async fn send_deleted_subscription_dm(
         to_npub.to_bech32().expect("bech32")
     );
 
-    let event_id = client.send_direct_msg(npub, content, None).await?;
-    debug!("Sent DM: {event_id}");
-    client.disconnect().await?;
+    let sent = send_nip04_dm(&client, &keys, npub, content).await?;
+    debug!("Sent DM: {sent}");
+    client.disconnect().await;
 
     Ok(())
 }
 
 #[cfg(not(test))]
 async fn send_deleted_user_dm(keys: Keys, npub: PublicKey) -> anyhow::Result<()> {
-    let client = nostr_sdk::Client::new(&keys);
+    let client = nostr_sdk::Client::new(keys.clone());
     client.add_relay("wss://relay.damus.io").await?;
     client.connect().await;
 
     let content = String::from("You have deleted your Zapple Pay account.");
 
-    let event_id = client.send_direct_msg(npub, content, None).await?;
-    debug!("Sent DM: {event_id}");
-    client.disconnect().await?;
+    let sent = send_nip04_dm(&client, &keys, npub, content).await?;
+    debug!("Sent DM: {sent}");
+    client.disconnect().await;
 
     Ok(())
 }
@@ -289,7 +317,7 @@ pub(crate) async fn set_user_config_impl(
     let npub = payload.npub;
     let amt = payload.amount_sats;
     let secret_key_pk: PublicKey = match payload.nwc.as_ref() {
-        Some(nwc) => nwc.secret.x_only_public_key(&SECP256K1).0.into(),
+        Some(nwc) => nwc.secret.x_only_public_key(SECP256K1).0.into(),
         None => payload.auth_id.unwrap(),
     };
     let mut conn = state.db_pool.get()?;
@@ -351,7 +379,7 @@ pub(crate) async fn create_user_subscription_impl(
     let amt = payload.amount_sats;
     let period = payload.time_period;
     let secret_key_pk: PublicKey = match payload.nwc.as_ref() {
-        Some(nwc) => nwc.secret.x_only_public_key(&SECP256K1).0.into(),
+        Some(nwc) => nwc.secret.x_only_public_key(SECP256K1).0.into(),
         None => payload.auth_id.unwrap(),
     };
     let mut conn = state.db_pool.get()?;
@@ -907,7 +935,7 @@ pub async fn count(
     }
 }
 
-pub async fn relays_impl(state: &State) -> anyhow::Result<HashMap<Url, usize>> {
+pub async fn relays_impl(state: &State) -> anyhow::Result<HashMap<RelayUrl, usize>> {
     let mut conn = state.db_pool.get()?;
     let mut zap = ZapConfig::get_nwc_relays(&mut conn)?;
     let subs = SubscriptionConfig::get_nwc_relays(&mut conn)?;
@@ -921,7 +949,7 @@ pub async fn relays_impl(state: &State) -> anyhow::Result<HashMap<Url, usize>> {
 
 pub async fn relays(
     Extension(state): Extension<State>,
-) -> Result<Json<HashMap<Url, usize>>, (StatusCode, String)> {
+) -> Result<Json<HashMap<RelayUrl, usize>>, (StatusCode, String)> {
     match relays_impl(&state).await {
         Ok(res) => Ok(Json(res)),
         Err(e) => Err(handle_anyhow_error(e)),
@@ -954,11 +982,12 @@ mod test {
     use axum::body::Body;
     use axum::http::{header, Request};
     use axum::response::Response;
-    use bitcoin::bip32::ExtendedPrivKey;
+    use bitcoin::bip32::Xpriv;
     use diesel::r2d2::{ConnectionManager, Pool};
     use diesel::RunQueryDsl;
     use diesel_migrations::MigrationHarness;
-    use nostr::{HttpMethod, Timestamp};
+    use nostr::nips::nip98::HttpMethod;
+    use nostr::Timestamp;
     use std::sync::Arc;
     use tokio::sync::{watch, Mutex};
     use tower::ServiceExt;
@@ -994,7 +1023,7 @@ mod test {
         let (tx, _) = watch::channel(vec![]);
         let auth_channel = Arc::new(Mutex::new(tx));
         let server_keys = Keys::generate();
-        let xpriv = ExtendedPrivKey::new_master(bitcoin::Network::Testnet, &[]).unwrap();
+        let xpriv = Xpriv::new_master(bitcoin::Network::Testnet, &[]).unwrap();
 
         State {
             db_pool,
@@ -1043,7 +1072,9 @@ mod test {
     }
 
     async fn body_string(res: Response) -> String {
-        let bytes = hyper::body::to_bytes(res.into_body()).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
@@ -1448,6 +1479,32 @@ mod test {
         assert_eq!(list.len(), MAX_PENDING_WALLET_AUTHS);
         assert!(!list.contains(&first));
         assert_eq!(*list.last().unwrap(), newest);
+    }
+
+    /// Confirmation DMs stay legacy NIP-04 kind 4 (what upstream sent): a
+    /// `p` tag for the recipient, content the recipient can decrypt, signed
+    /// by the server key. Nothing NIP-17 shaped.
+    #[test]
+    fn config_dm_is_nip04_kind4_decryptable_by_recipient() {
+        let server = Keys::generate();
+        let user = Keys::generate();
+        let text = "You have configured Zapple Pay to zap 21 sats!";
+        let event = build_nip04_dm(&server, user.public_key(), text).unwrap();
+        assert_eq!(event.kind, nostr::Kind::EncryptedDirectMessage);
+        assert_eq!(event.pubkey, server.public_key());
+        assert!(event.verify().is_ok());
+        assert_eq!(
+            event.tags.public_keys().copied().collect::<Vec<_>>(),
+            vec![user.public_key()]
+        );
+        assert!(
+            !event.content.contains("Zapple"),
+            "content must be encrypted"
+        );
+        let plain =
+            nostr::nips::nip04::decrypt(user.secret_key(), &server.public_key(), &event.content)
+                .unwrap();
+        assert_eq!(plain, text);
     }
 
     #[test]

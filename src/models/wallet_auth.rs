@@ -1,4 +1,4 @@
-use bitcoin::bip32::{ChildNumber, ExtendedPrivKey};
+use bitcoin::bip32::{ChildNumber, Xpriv};
 use diesel::prelude::*;
 use nostr::key::PublicKey;
 use nostr::SECP256K1;
@@ -59,7 +59,7 @@ impl WalletAuth {
             .map(|s| PublicKey::from_str(s).expect("invalid user_pubkey"))
     }
 
-    pub fn create(conn: &mut PgConnection, xpriv: ExtendedPrivKey) -> anyhow::Result<Self> {
+    pub fn create(conn: &mut PgConnection, xpriv: Xpriv) -> anyhow::Result<Self> {
         conn.transaction(|conn| {
             // Get the next value from the sequence
             let query =
@@ -70,12 +70,12 @@ impl WalletAuth {
             // Derive the pubkey for the next index
             let (derived_pubkey, _) = xpriv
                 .derive_priv(
-                    &SECP256K1,
+                    SECP256K1,
                     &[ChildNumber::from_hardened_idx(next_index as u32).unwrap()],
                 )
                 .unwrap()
                 .private_key
-                .x_only_public_key(&SECP256K1);
+                .x_only_public_key(SECP256K1);
 
             // Now, you can insert the row with the reserved `index`, and the derived values
             let result = diesel::insert_into(wallet_auth::table)
@@ -153,13 +153,18 @@ impl WalletAuth {
         }))
     }
 
+    /// Pending (not yet linked) NWA keys the listener should watch at startup:
+    /// the ones created within the last day. Upstream had this bound inverted
+    /// (`lt`), so a restart between `/wallet-auth` and the wallet's kind 33194
+    /// reply re-watched only abandoned keys and silently dropped every live
+    /// one; `/check-wallet-auth` then polled forever.
     pub fn get_unlinked(conn: &mut PgConnection) -> anyhow::Result<Vec<PublicKey>> {
         let unlinked = wallet_auth::table
             .select(wallet_auth::pubkey)
             .filter(wallet_auth::user_pubkey.is_null())
             .filter(
                 wallet_auth::created_at
-                    .lt(chrono::Utc::now().naive_utc() - chrono::Duration::days(1)),
+                    .gt(chrono::Utc::now().naive_utc() - chrono::Duration::days(1)),
             )
             .order(wallet_auth::created_at.desc())
             .limit(MAX_PENDING_WALLET_AUTHS as i64)
@@ -196,7 +201,7 @@ impl WalletAuth {
 mod test {
     use crate::models::wallet_auth::WalletAuth;
     use crate::models::MIGRATIONS;
-    use bitcoin::bip32::ExtendedPrivKey;
+    use bitcoin::bip32::Xpriv;
     use diesel::r2d2::{ConnectionManager, Pool};
     use diesel::{Connection, PgConnection, RunQueryDsl};
     use diesel_migrations::MigrationHarness;
@@ -236,48 +241,64 @@ mod test {
         .unwrap();
     }
 
-    /// The startup seed for the listener's pending-auth list is bounded to
-    /// the newest `MAX_PENDING_WALLET_AUTHS` qualifying rows and returned
-    /// oldest-first, matching the runtime list shape.
+    /// The startup seed for the listener's pending-auth list: fresh unlinked
+    /// keys only (created within the last day), bounded to the newest
+    /// `MAX_PENDING_WALLET_AUTHS` and returned oldest-first, matching the
+    /// runtime list shape. Stale and already-linked rows are excluded.
+    /// Flipping the bound back to `lt` makes the stale row the only hit.
     #[tokio::test]
-    async fn test_get_unlinked_is_bounded_and_oldest_first() {
+    async fn test_get_unlinked_is_fresh_bounded_and_oldest_first() {
         use crate::models::schema::wallet_auth;
         use crate::models::wallet_auth::MAX_PENDING_WALLET_AUTHS;
         use diesel::{ExpressionMethods, QueryDsl};
 
         let db_pool = init_db();
         let conn = &mut db_pool.get().unwrap();
-        let xpriv = ExtendedPrivKey::new_master(bitcoin::Network::Testnet, &[]).unwrap();
+        let xpriv = Xpriv::new_master(bitcoin::Network::Testnet, &[]).unwrap();
 
-        // Only rows older than a day qualify, so fresh rows left behind by
-        // other tests are invisible here; remove any old ones from a prior run.
-        let cutoff = chrono::Utc::now().naive_utc() - chrono::Duration::days(1);
-        diesel::delete(wallet_auth::table.filter(wallet_auth::created_at.lt(cutoff)))
-            .execute(conn)
-            .unwrap();
+        // Start from an empty table: other tests leave fresh unlinked rows
+        // behind, which this query is now supposed to see.
+        clear_database(conn);
+        diesel::delete(wallet_auth::table).execute(conn).unwrap();
         assert!(WalletAuth::get_unlinked(conn).unwrap().is_empty());
 
-        // MAX + 2 unlinked rows, created one second apart, all older than a day.
+        let now = chrono::Utc::now().naive_utc();
+        let set_created_at = |conn: &mut PgConnection, index: i32, at: chrono::NaiveDateTime| {
+            diesel::update(wallet_auth::table.filter(wallet_auth::index.eq(index)))
+                .set(wallet_auth::created_at.eq(at))
+                .execute(conn)
+                .unwrap();
+        };
+
+        // Abandoned: unlinked but two days old -> not re-watched.
+        let stale = WalletAuth::create(conn, xpriv).unwrap();
+        set_created_at(conn, stale.index, now - chrono::Duration::days(2));
+        assert!(WalletAuth::get_unlinked(conn).unwrap().is_empty());
+
+        // Linked: fresh but already has a user -> nothing to wait for.
+        let linked = WalletAuth::create(conn, xpriv).unwrap();
+        let user = PublicKey::from_str(PUBKEY).unwrap();
+        WalletAuth::add_user_data(conn, linked.pubkey(), user, None).unwrap();
+        assert!(WalletAuth::get_unlinked(conn).unwrap().is_empty());
+
+        // Live: MAX + 2 fresh unlinked rows one second apart, newest last.
         let extra = 2;
-        let base = chrono::Utc::now().naive_utc() - chrono::Duration::days(3);
+        let base = now - chrono::Duration::hours(1);
         let mut created: Vec<PublicKey> = Vec::new();
         for i in 0..(MAX_PENDING_WALLET_AUTHS + extra) {
             let auth = WalletAuth::create(conn, xpriv).unwrap();
-            diesel::update(wallet_auth::table.filter(wallet_auth::index.eq(auth.index)))
-                .set(wallet_auth::created_at.eq(base + chrono::Duration::seconds(i as i64)))
-                .execute(conn)
-                .unwrap();
+            set_created_at(conn, auth.index, base + chrono::Duration::seconds(i as i64));
             created.push(auth.pubkey());
         }
 
         let unlinked = WalletAuth::get_unlinked(conn).unwrap();
         assert_eq!(unlinked.len(), MAX_PENDING_WALLET_AUTHS);
-        // The two oldest fell outside the window; the rest come back oldest-first.
+        // The two oldest fell off the cap; the rest come back oldest-first.
         assert_eq!(unlinked.as_slice(), &created[extra..]);
+        assert!(!unlinked.contains(&stale.pubkey()));
+        assert!(!unlinked.contains(&linked.pubkey()));
 
-        diesel::delete(wallet_auth::table.filter(wallet_auth::created_at.lt(cutoff)))
-            .execute(conn)
-            .unwrap();
+        diesel::delete(wallet_auth::table).execute(conn).unwrap();
     }
 
     #[tokio::test]
@@ -286,7 +307,7 @@ mod test {
         let conn = &mut db_pool.get().unwrap();
         clear_database(conn);
 
-        let xpriv = ExtendedPrivKey::new_master(bitcoin::Network::Bitcoin, &[]).unwrap();
+        let xpriv = Xpriv::new_master(bitcoin::Network::Bitcoin, &[]).unwrap();
         let wallet_auth = WalletAuth::create(conn, xpriv).unwrap();
 
         let pubkey = wallet_auth.pubkey();
@@ -316,7 +337,7 @@ mod test {
         let conn = &mut db_pool.get().unwrap();
         clear_database(conn);
 
-        let xpriv = ExtendedPrivKey::new_master(bitcoin::Network::Bitcoin, &[]).unwrap();
+        let xpriv = Xpriv::new_master(bitcoin::Network::Bitcoin, &[]).unwrap();
         let wallet_auth = WalletAuth::create(conn, xpriv).unwrap();
 
         let pubkey = wallet_auth.pubkey();
